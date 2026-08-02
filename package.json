@@ -1,0 +1,35 @@
+{
+  "name": "payout-invariance",
+  "version": "0.1.0",
+  "description": "Prove a ranking/recommendation/comparison engine's output does not change based on which option pays the operator more — a runtime mutation check plus a static import check, both framework-agnostic.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "keywords": [
+    "affiliate-neutrality",
+    "ranking",
+    "recommendation-engine",
+    "testing",
+    "honesty",
+    "property-testing",
+    "vitest"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.4",
+    "vitest": "^4.1.10"
+  }
+}
