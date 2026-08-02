@@ -3,15 +3,21 @@
   "version": "0.1.0",
   "description": "Prove a ranking/recommendation/comparison engine's output does not change based on which option pays the operator more — a runtime mutation check plus a static import check, both framework-agnostic.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "files": [
+    "dist",
     "src",
     "README.md"
   ],
+  "sideEffects": false,
   "keywords": [
     "affiliate-neutrality",
     "ranking",
@@ -24,7 +30,8 @@
   "license": "MIT",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {},
   "devDependencies": {
