@@ -46,7 +46,7 @@ export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === null || b === null) return a === b;
   if (typeof a !== "object") return false; // primitives already handled by Object.is
 
-  const objA = a as object;
+  const objA = a;
   const objB = b as object;
 
   if (objA instanceof Date || objB instanceof Date) {
@@ -88,8 +88,8 @@ export function deepEqual(a: unknown, b: unknown): boolean {
     return true;
   }
 
-  const keysA = Object.keys(objA as Record<string, unknown>);
-  const keysB = Object.keys(objB as Record<string, unknown>);
+  const keysA = Object.keys(objA);
+  const keysB = Object.keys(objB);
   if (keysA.length !== keysB.length) return false;
   return keysA.every((key) =>
     Object.prototype.hasOwnProperty.call(objB, key) &&
