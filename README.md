@@ -1,27 +1,20 @@
 # payout-invariance
 
-Two small, zero-dependency, framework-agnostic TypeScript checks that let a
-ranking, recommendation, or comparison engine — a job board, a marketplace, an
-insurance or real-estate comparison site, a review aggregator, a
-credit-card/points optimizer, anything that ranks options and also gets paid
-differently depending which option a user picks — **prove** its output isn't
-influenced by which option pays the operator more, instead of just asserting
-it in a "trust us" paragraph. One check re-runs your real ranking function
-under adversarial payout mutations and diffs the result (runtime); the other
-statically greps your scoring code and its dependencies for any reference to
-payout data at all (static). Together they give you a runtime guarantee and a
-structural guarantee, and neither one depends on a test framework — both
-return plain data so you can wire them into vitest, jest, node:test, or a
-one-off script.
+Two small, zero-dependency, framework-agnostic TypeScript checks for
+ranking, recommendation, and comparison engines that receive different payouts
+for different options. They test whether a ranking changes under configured
+payout mutations and scan selected scoring files for configured payout
+identifiers. Together, they provide two bounded checks; neither proves general
+payout neutrality. Both return plain data so you can wire them into vitest,
+jest, node:test, or a one-off script.
 
-Comparison and marketplace sites almost always take money from at least some
-of the things they rank, and almost every one of them says some version of
-"our rankings aren't affected by that." Usually that's a policy statement, not
-something verified by CI. This library turns it into a test: if a future
-refactor lets payout leak into the ranking, either check fails the build. That
-converts "we promise our list isn't for sale" from a claim about intentions
-into a property of the code that's checked on every commit — which is a much
-stronger thing to be able to tell users, partners, or a skeptical journalist.
+Comparison and marketplace sites often take money from at least some of the
+things they rank, and many say some version of "our rankings aren't affected
+by that." Usually that's a policy statement, not something checked by CI.
+These checks make part of that claim testable: the runtime check exercises
+specified payout mutations, and the static check searches selected files for
+configured identifiers. They can flag issues covered by those scenarios and
+scan rules; a passing result does not establish general payout neutrality.
 
 ## Install
 
