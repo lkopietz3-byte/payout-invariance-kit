@@ -343,9 +343,13 @@ export interface AssertNoPayoutImportsOptions {
   /**
    * Strip single-line comments (`// ...`) and whole lines that are part of
    * a `/* ... *\/` block comment before matching, so a comment that merely
-   * MENTIONS a forbidden identifier doesn't count as a reference. This is a
-   * best-effort, line-based strip (not a real parser) — see README.md
-   * "limits" section. Defaults to true.
+   * MENTIONS a forbidden identifier doesn't count as a reference. String and
+   * template literals on the same line are tracked so a `//` inside one
+   * (e.g. `"https://example.com/payout"`) is not mistaken for the start of a
+   * line comment. This is still a best-effort, line-based strip (not a real
+   * parser) — see README.md "Honest limits": a string or template literal
+   * that itself spans multiple lines is not tracked across the line break.
+   * Defaults to true.
    */
   stripComments?: boolean;
   /**
@@ -382,36 +386,75 @@ function toMatcher(identifier: string | RegExp, caseInsensitive: boolean): RegEx
   // \b works on word characters, so this also catches identifiers embedded
   // in import specifiers like "@/lib/affiliate" (the '/' and quote around
   // it are non-word characters, so the boundary still lands correctly).
+  // It will NOT catch this identifier as a fragment of a larger camelCase or
+  // snake_case identifier (e.g. "payout" inside "computePayoutForCard" or
+  // "payout_rate_bps") — pass a RegExp without \b (e.g. /payout/i) for that.
   const flags = "g" + (caseInsensitive ? "i" : "");
   return new RegExp(`\\b${escapeRegExp(identifier)}\\b`, flags);
 }
 
-/** Strip `//` line comments and lines that are purely part of a block comment. */
+/**
+ * Strip `//` line comments and lines that are purely part of a block
+ * comment, while tracking same-line single/double-quoted and template
+ * string literals so a `//` or `/*` sequence inside one is not mistaken for
+ * the start of a comment (e.g. a URL like `"https://host/payout"`, or a
+ * `/* not a comment *\/`-looking substring inside a string). A string that
+ * itself spans multiple lines (an unterminated literal, or a multi-line
+ * template literal) is not tracked past the line break — this remains a
+ * best-effort, line-based strip, not a real parser.
+ */
 function stripCommentLines(src: string): string {
   let inBlockComment = false;
   return src
     .split("\n")
     .map((rawLine) => {
-      let line = rawLine;
-      if (inBlockComment) {
-        const end = line.indexOf("*/");
-        if (end === -1) return "";
-        line = line.slice(end + 2);
-        inBlockComment = false;
-      }
-      const blockStart = line.indexOf("/*");
-      if (blockStart !== -1) {
-        const blockEnd = line.indexOf("*/", blockStart + 2);
-        if (blockEnd !== -1) {
-          line = line.slice(0, blockStart) + line.slice(blockEnd + 2);
-        } else {
-          line = line.slice(0, blockStart);
-          inBlockComment = true;
+      let out = "";
+      let inString: string | null = null;
+      let i = 0;
+      while (i < rawLine.length) {
+        // .charAt() always returns `string` (empty past the end), unlike
+        // indexed access, which TypeScript would otherwise widen to
+        // `string | undefined` under noUncheckedIndexedAccess.
+        const ch = rawLine.charAt(i);
+        const next = rawLine.charAt(i + 1);
+
+        if (inBlockComment) {
+          const end = rawLine.indexOf("*/", i);
+          if (end === -1) return out; // rest of the line is inside the block comment
+          i = end + 2;
+          inBlockComment = false;
+          continue;
         }
+
+        if (inString !== null) {
+          out += ch;
+          if (ch === "\\" && next !== "") {
+            out += next;
+            i += 2;
+            continue;
+          }
+          if (ch === inString) inString = null;
+          i += 1;
+          continue;
+        }
+
+        if (ch === "/" && next === "/") return out; // rest of the line is a line comment
+        if (ch === "/" && next === "*") {
+          inBlockComment = true;
+          i += 2;
+          continue;
+        }
+        if (ch === "'" || ch === '"' || ch === "`") {
+          inString = ch;
+          out += ch;
+          i += 1;
+          continue;
+        }
+
+        out += ch;
+        i += 1;
       }
-      const lineCommentIdx = line.indexOf("//");
-      if (lineCommentIdx !== -1) line = line.slice(0, lineCommentIdx);
-      return line;
+      return out;
     })
     .join("\n");
 }
@@ -447,6 +490,16 @@ function normalizeToMap(files: SourceFiles): Record<string, string> {
  *
  *   const offenses = assertNoPayoutImports(files, ["commission", "payout"]);
  *   expect(offenses).toEqual([]);
+ *
+ * This is a text-pattern grep, not a type checker or bundler: it cannot see
+ * indirect dependence (a value smuggled through a generically-named field),
+ * closures that capture a payout value without naming it in the scanned
+ * file, computed/dynamic property access (`obj["pay" + "out"]`), a `payout`
+ * re-exported under an aliased name, or a `require`/`import()` built from a
+ * runtime string. It also will not catch a forbidden word embedded inside a
+ * larger identifier with no delimiter (see `toMatcher`). See README.md,
+ * "Honest limits", for the full list — an empty result is a signal, not a
+ * guarantee.
  */
 export function assertNoPayoutImports(
   files: SourceFiles,
