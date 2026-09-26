@@ -1,5 +1,5 @@
 /**
- * Runnable example: both payout-invariance functions exercised against a
+ * Runnable example: both payout-invariance-kit functions exercised against a
  * tiny, self-contained toy ranking engine (a generic "marketplace listing"
  * ranker). Nothing here references any real product, card, program, or
  * business — it's illustrative only.
