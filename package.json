@@ -1,7 +1,7 @@
 {
   "name": "payout-invariance-kit",
   "version": "0.1.0",
-  "description": "Prove a ranking/recommendation/comparison engine's output does not change based on which option pays the operator more — a runtime mutation check plus a static import check, both framework-agnostic.",
+  "description": "Check whether a ranking/recommendation/comparison engine's output changes based on which option pays the operator more — a runtime mutation check plus a static import check, both framework-agnostic.",
   "keywords": [
     "affiliate-neutrality",
     "ranking",
