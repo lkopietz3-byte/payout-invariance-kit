@@ -1,10 +1,10 @@
 /**
- * payout-invariance
- * ------------------
+ * payout-invariance-kit
+ * ----------------------
  * Two framework-agnostic checks for any ranking, recommendation, or
  * comparison engine (job boards, marketplaces, insurance comparison sites,
  * real-estate listing sites, review aggregators, credit-card/points
- * optimizers, ...) that wants to PROVE — not merely claim — that its output
+ * optimizers, ...) that wants to check — not merely claim — that its output
  * ordering is not influenced by which option pays the operator more.
  *
  *   1. assertPayoutInvariance — a RUNTIME check. Re-runs a pure ranking
@@ -14,6 +14,10 @@
  *   2. assertNoPayoutImports — a STATIC check. Greps a set of source files
  *      for any reference to payout-related identifiers, so you can assert
  *      the ranking engine's code never even has payout data in scope.
+ *
+ * A passing `assertPayoutInvariance` result means "no difference in the
+ * scenarios you tested", not "the ranking function ignores payout in
+ * general". See README.md, "Honest limits".
  *
  * Zero runtime dependencies. Pure TypeScript. Nothing here calls a test
  * framework's `expect()` — both functions return plain data so you can wire
@@ -29,6 +33,7 @@
 import { readFileSync } from "node:fs";
 
 import { deepEqual } from "./deepEqual.js";
+import { snapshot } from "./snapshot.js";
 
 export { deepEqual };
 
@@ -38,9 +43,12 @@ export { deepEqual };
 
 /**
  * One named, adversarial way of rewriting the payout data on an input before
- * re-ranking. `mutate` must be pure: it should return a new input (or a
- * deliberately-mutated copy) and must NOT depend on anything outside its
- * arguments, so the check stays reproducible.
+ * re-ranking. `mutate` must be pure and synchronous: it must return a new
+ * input (or a deliberately-mutated copy) without depending on anything
+ * outside its arguments, and it must not modify `baseInput` in place — every
+ * scenario is mutated from the same `baseInput`, so an in-place edit would
+ * corrupt every later scenario. `assertPayoutInvariance` detects and throws
+ * on both an in-place edit and a mutate that returns a Promise.
  *
  * Name mutations for what they attack, not just "test 1" — e.g. "every
  * candidate gets an equal juicy payout", "the worst candidate gets the
@@ -51,7 +59,7 @@ export { deepEqual };
 export interface PayoutMutationScenario<TInput> {
   /** Short, descriptive name for this mutation — shown in failure output. */
   name: string;
-  /** Pure function: base input -> mutated input (payout field(s) changed). */
+  /** Pure, synchronous function: base input -> mutated input (payout field(s) changed). */
   mutate: (baseInput: TInput) => TInput;
 }
 
@@ -62,7 +70,8 @@ export interface AssertPayoutInvarianceOptions<TInput, TResult> {
    * comparison for plain data. Override this if your rank function returns
    * something with non-comparable fields (timestamps, random ids) that you
    * want to ignore — project those out before comparing, or supply a custom
-   * comparator.
+   * comparator. Must return a boolean; anything else (including a Promise)
+   * makes `assertPayoutInvariance` throw.
    */
   isEqual?: (expected: TResult, actual: TResult) => boolean;
   /**
@@ -78,7 +87,8 @@ export interface AssertPayoutInvarianceOptions<TInput, TResult> {
    * Supply your own to be more precise (e.g. compare only the known payout
    * field(s) instead of the whole input) if you want a tighter guarantee
    * that the CHANGED part is specifically the payout data and not some
-   * unrelated field.
+   * unrelated field. Must return a boolean; anything else makes
+   * `assertPayoutInvariance` throw.
    */
   hasChanged?: (baseInput: TInput, mutatedInput: TInput) => boolean;
 }
@@ -116,17 +126,80 @@ export interface PayoutInvarianceResult<TInput, TResult> {
   vacuous: string[];
 }
 
+function isThenable(value: unknown): boolean {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+function describeError(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return "(unprintable thrown value)";
+  }
+}
+
+function validateMutations<TInput>(mutations: unknown): PayoutMutationScenario<TInput>[] {
+  if (!Array.isArray(mutations)) {
+    throw new TypeError("assertPayoutInvariance: mutations must be an array of { name, mutate } objects.");
+  }
+  if (mutations.length === 0) {
+    throw new Error(
+      "assertPayoutInvariance: mutations is empty, so nothing would be tested. Pass at least one scenario.",
+    );
+  }
+  mutations.forEach((scenario: unknown, index) => {
+    const candidate = scenario as Partial<PayoutMutationScenario<TInput>> | null;
+    if (
+      typeof candidate !== "object" ||
+      candidate === null ||
+      typeof candidate.name !== "string" ||
+      typeof candidate.mutate !== "function"
+    ) {
+      throw new TypeError(
+        `assertPayoutInvariance: mutations[${index}] must be an object with a string "name" and a "mutate" function.`,
+      );
+    }
+  });
+  return [...(mutations as PayoutMutationScenario<TInput>[])];
+}
+
 /**
  * Re-run a pure ranking function once per payout-mutation scenario and
  * confirm the output is unchanged from the unmutated baseline.
  *
- * `rankFn` must be pure (same input -> same output, no hidden state) or the
- * comparison is meaningless. This library does not call it more than once
- * per scenario and never mutates its result.
+ * `rankFn` must be pure and synchronous (same input -> same output, no
+ * hidden state, no Promise) or the comparison is meaningless. This library
+ * calls it exactly once per scenario (plus once for the baseline) and never
+ * mutates its input or its result.
  *
  * Returns a plain result object rather than throwing or calling a test
  * framework's `expect()`, so it works with any test runner (or none). See
  * README.md for a vitest adapter example.
+ *
+ * Throws, rather than returning a result, when the run cannot be trusted:
+ * - `rankFn` is not a function, or `mutations` is not a non-empty array of
+ *   `{ name, mutate }` (checked before anything runs).
+ * - `rankFn` throws on the baseline or on a mutated input, or `mutate`
+ *   throws. The error names the scenario and keeps the original error as
+ *   `cause`.
+ * - `rankFn` or `mutate` returns a Promise (or any thenable). This function
+ *   is synchronous; awaiting inside `rankFn`/`mutate` and passing the
+ *   resolved value in is the fix — see README.md, "Async ranking functions".
+ * - `rankFn` or `mutate` modified `baseInput` in place (detected by
+ *   comparing against a deep copy taken before the first call). Every
+ *   scenario starts from the same `baseInput`, so an in-place edit by an
+ *   earlier call would corrupt every later scenario.
+ * - a later `rankFn` call modified the ranking result object it returned for
+ *   the baseline (for example, a rank function that clears and refills one
+ *   shared output array). Undetected, this would make `baseline` and
+ *   `actual` the same mutated object and always compare equal, regardless of
+ *   whether payout actually changed the ranking.
+ * - `isEqual` or `hasChanged` returns anything but a boolean (for example a
+ *   Promise, which is always truthy and would make every scenario "pass").
  */
 export function assertPayoutInvariance<TInput, TResult>(
   rankFn: (input: TInput) => TResult,
@@ -134,26 +207,113 @@ export function assertPayoutInvariance<TInput, TResult>(
   mutations: PayoutMutationScenario<TInput>[],
   opts: AssertPayoutInvarianceOptions<TInput, TResult> = {},
 ): PayoutInvarianceResult<TInput, TResult> {
+  if (typeof rankFn !== "function") {
+    throw new TypeError("assertPayoutInvariance: rankFn must be a function.");
+  }
+  const list = validateMutations<TInput>(mutations);
   const isEqual = opts.isEqual ?? deepEqual;
   const hasChanged = opts.hasChanged ?? ((base, mutated) => !deepEqual(base, mutated));
 
-  const baseline = rankFn(baseInput);
+  const pristineInput = snapshot(baseInput);
+  const assertBaseUntouched = (who: string): void => {
+    if (!deepEqual(pristineInput, baseInput)) {
+      throw new Error(
+        `assertPayoutInvariance: ${who} modified baseInput in place. Neither rankFn nor mutate may change ` +
+          `their argument (copy before sorting or editing); every scenario starts from the same baseInput, ` +
+          `so the comparison can no longer be trusted.`,
+      );
+    }
+  };
+
+  const callRankFn = (input: TInput, where: string): TResult => {
+    let output: TResult | undefined;
+    let rankError: unknown;
+    let rankFailed = false;
+    try {
+      output = rankFn(input);
+    } catch (error) {
+      rankFailed = true;
+      rankError = error;
+    }
+    if (rankFailed) {
+      throw new Error(`assertPayoutInvariance: rankFn threw ${where}: ${describeError(rankError)}`, {
+        cause: rankError,
+      });
+    }
+    if (isThenable(output)) {
+      throw new TypeError(
+        `assertPayoutInvariance: rankFn returned a Promise (or thenable) ${where}. assertPayoutInvariance ` +
+          `is synchronous and would compare two Promise objects (which are always "equal" once their own ` +
+          `properties are compared), not the values they resolve to. Await rankFn yourself and pass the ` +
+          `resolved value in. See README.md, "Async ranking functions".`,
+      );
+    }
+    return output as TResult;
+  };
+
+  const checkedBoolean = (hook: string, where: string, value: unknown): boolean => {
+    if (typeof value !== "boolean") {
+      throw new TypeError(
+        `assertPayoutInvariance: ${hook} must return a boolean, got ${
+          isThenable(value) ? "a Promise (or thenable)" : value === null ? "null" : typeof value
+        } ${where}.`,
+      );
+    }
+    return value;
+  };
+
+  const baseline = callRankFn(baseInput, "on the baseline input");
+  assertBaseUntouched("rankFn (on the baseline input)");
+  // rankFn may return an object it later reuses (a buffer it clears and
+  // refills). If a later call rewrote the baseline result in place, baseline
+  // and actual would be the same object and always compare equal, so detect
+  // that too.
+  const baselineCopy = snapshot(baseline);
 
   const failures: PayoutInvarianceFailure<TInput, TResult>[] = [];
   const vacuous: string[] = [];
 
-  for (const { name, mutate } of mutations) {
-    const mutatedInput = mutate(baseInput);
+  for (const { name, mutate } of list) {
+    if (typeof mutate !== "function") {
+      throw new TypeError(`assertPayoutInvariance: scenario "${name}": mutate must be a function.`);
+    }
+
+    let mutatedInput: TInput;
+    try {
+      mutatedInput = mutate(baseInput);
+    } catch (error) {
+      throw new Error(`assertPayoutInvariance: scenario "${name}": mutate() threw: ${describeError(error)}`, {
+        cause: error,
+      });
+    }
+    if (isThenable(mutatedInput)) {
+      throw new TypeError(
+        `assertPayoutInvariance: scenario "${name}": mutate() returned a Promise (or thenable). mutate must ` +
+          `be synchronous.`,
+      );
+    }
+    assertBaseUntouched(`scenario "${name}": mutate()`);
 
     // Precondition guard: a mutation that changed nothing can't prove
     // invariance. Flag it instead of letting it silently count as a pass.
-    if (!hasChanged(baseInput, mutatedInput)) {
+    if (!checkedBoolean("hasChanged", `for scenario "${name}"`, hasChanged(baseInput, mutatedInput))) {
       vacuous.push(name);
       continue;
     }
 
-    const actual = rankFn(mutatedInput);
-    if (!isEqual(baseline, actual)) {
+    const actual = callRankFn(
+      mutatedInput,
+      `on the mutated input for scenario "${name}" (it did not throw on the baseline input)`,
+    );
+    assertBaseUntouched(`scenario "${name}": rankFn`);
+    if (!deepEqual(baselineCopy, baseline)) {
+      throw new Error(
+        `assertPayoutInvariance: rankFn modified its earlier (baseline) result in place during scenario ` +
+          `"${name}". Return a fresh value from every call, or the baseline can no longer be compared.`,
+      );
+    }
+
+    if (!checkedBoolean("isEqual", `for scenario "${name}"`, isEqual(baseline, actual))) {
       failures.push({ scenario: name, mutatedInput, expected: baseline, actual });
     }
   }
