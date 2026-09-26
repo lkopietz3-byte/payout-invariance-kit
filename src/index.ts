@@ -28,74 +28,9 @@
 // this import is never called.
 import { readFileSync } from "node:fs";
 
-// ---------------------------------------------------------------------------
-// Shared: a small, dependency-free structural deep-equal.
-// ---------------------------------------------------------------------------
+import { deepEqual } from "./deepEqual.js";
 
-/**
- * Structural deep equality for plain JS values: primitives, Date, RegExp,
- * arrays, Maps, Sets, and plain objects. Good enough for comparing ranking
- * results (arrays/objects of candidates, scores, ids) without pulling in a
- * dependency. NaN === NaN is treated as equal (matches Object.is semantics
- * for that one case), which is what you want when comparing scores.
- */
-export function deepEqual(a: unknown, b: unknown): boolean {
-  if (Object.is(a, b)) return true;
-
-  if (typeof a !== typeof b) return false;
-  if (a === null || b === null) return a === b;
-  if (typeof a !== "object") return false; // primitives already handled by Object.is
-
-  const objA = a;
-  const objB = b as object;
-
-  if (objA instanceof Date || objB instanceof Date) {
-    return objA instanceof Date && objB instanceof Date && objA.getTime() === objB.getTime();
-  }
-
-  if (objA instanceof RegExp || objB instanceof RegExp) {
-    return objA instanceof RegExp && objB instanceof RegExp && String(objA) === String(objB);
-  }
-
-  if (Array.isArray(objA) || Array.isArray(objB)) {
-    if (!Array.isArray(objA) || !Array.isArray(objB)) return false;
-    if (objA.length !== objB.length) return false;
-    return objA.every((item, i) => deepEqual(item, objB[i]));
-  }
-
-  if (objA instanceof Map || objB instanceof Map) {
-    if (!(objA instanceof Map) || !(objB instanceof Map)) return false;
-    if (objA.size !== objB.size) return false;
-    for (const [key, val] of objA) {
-      if (!objB.has(key) || !deepEqual(val, objB.get(key))) return false;
-    }
-    return true;
-  }
-
-  if (objA instanceof Set || objB instanceof Set) {
-    if (!(objA instanceof Set) || !(objB instanceof Set)) return false;
-    if (objA.size !== objB.size) return false;
-    for (const val of objA) {
-      let found = false;
-      for (const other of objB) {
-        if (deepEqual(val, other)) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) return false;
-    }
-    return true;
-  }
-
-  const keysA = Object.keys(objA);
-  const keysB = Object.keys(objB);
-  if (keysA.length !== keysB.length) return false;
-  return keysA.every((key) =>
-    Object.prototype.hasOwnProperty.call(objB, key) &&
-    deepEqual((objA as Record<string, unknown>)[key], (objB as Record<string, unknown>)[key]),
-  );
-}
+export { deepEqual };
 
 // ---------------------------------------------------------------------------
 // 1. assertPayoutInvariance — runtime invariance under payout mutation.
