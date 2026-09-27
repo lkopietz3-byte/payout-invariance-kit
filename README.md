@@ -45,18 +45,38 @@ npm install --save-dev payout-invariance-kit vitest
 
 Or build from source: clone the repository and run `npm install && npm run build`.
 
-Requires Node 20 or later. ESM only. Zero runtime dependencies —
+Requires Node 20 or later. ESM package — `import` works everywhere, and
+CommonJS `require("payout-invariance-kit")` works on Node versions that
+support `require(esm)` (Node >=20.19.0 or >=22.12.0; older Node 20/22 patch
+releases must use dynamic `import()` instead). Zero runtime dependencies —
 `dependencies: {}` in package.json. `assertNoPayoutImports`'s file-path mode
-uses Node's built-in `fs`; give it a pre-loaded content map instead if you
-need to run outside Node.
+loads Node's built-in `fs` lazily (via `process.getBuiltinModule`, Node
+>=20.16.0/>=22.3.0) and is never imported at the top level, so the module
+itself loads fine in a browser or Workers bundle; give it a pre-loaded
+content map instead of file paths if you need that mode to actually run
+outside Node.
 
 ## Quickstart
 
+Paste this as-is — it's a self-contained, runnable example (also run as a
+test in `test/readme-quickstart.test.ts`, so it can't drift from the code):
+
 ```ts
 import { assertPayoutInvariance } from "payout-invariance-kit";
-import { rank } from "../src/rank"; // your real ranking engine
 
-const baseInput = { candidates: [...] };
+const baseInput = {
+  candidates: [
+    { id: "a", score: 90, payoutRateBps: 50 },
+    { id: "b", score: 60, payoutRateBps: 0 },
+    { id: "c", score: 30, payoutRateBps: 500 },
+  ],
+};
+
+// Your real ranking engine goes here. This one only looks at `score`.
+function rank(input: typeof baseInput) {
+  const sorted = [...input.candidates].sort((a, b) => b.score - a.score);
+  return { orderedIds: sorted.map((c) => c.id) };
+}
 
 const result = assertPayoutInvariance(rank, baseInput, [
   {
@@ -79,6 +99,7 @@ const result = assertPayoutInvariance(rank, baseInput, [
 ]);
 
 // result: { passed, baseline, failures, vacuous }
+console.log(result.passed); // true — `rank` only looks at score, never payoutRateBps
 ```
 
 ## API
