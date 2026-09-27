@@ -4,9 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-09-27
+
+### Added
+
+- CommonJS `require()` support: `package.json` `exports` now has a
+  `"default"` condition alongside `"import"`, so `require("payout-invariance-kit")`
+  works on Node versions that support `require(esm)` (>=20.19.0, >=22.12.0).
+  ESM `import` is unaffected.
+- `scripts/consumer-probe.cjs`, run by `verify-package.mjs`, so CI guards the
+  CommonJS entry point going forward.
+
+### Fixed
+
+- The shipped `.js.map` pointed at `../src/*.ts`, which isn't in the
+  published tarball, breaking go-to-definition. `tsconfig.build.json` now
+  sets `inlineSources`, so the map embeds the original source directly.
+  `.d.ts.map` generation is turned off instead (see README's "Install").
+- The main entry imported Node's `node:fs` at the top of the file, which
+  bundlers targeting a browser or a Workers runtime resolve at bundle time —
+  breaking that build even for callers who never used the file-path mode of
+  `assertNoPayoutImports`. `node:fs` is now loaded lazily, only when that
+  mode is actually called.
+- The README "Quickstart" was pseudocode (a nonexistent import, an invalid
+  `[...]` spread) and threw a `SyntaxError` if pasted. It's now a
+  self-contained example that runs, and is pinned by
+  `test/readme-quickstart.test.ts`.
+
 ## [0.1.0] - 2026-09-27
 
-First release. Not yet published to npm.
+First release.
 
 ### Added
 
