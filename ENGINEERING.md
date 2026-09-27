@@ -55,9 +55,11 @@ has a regression test that failed against the pre-fix commit.
 
 ## Release and rollback
 
-- Version `0.1.0`, never published. Install is from GitHub until published.
+- `npm run verify` (lint, typecheck, test, build, verify:package) runs
+  automatically before publish via the `prepublishOnly` script.
 - Before a release: `npm ci && npm run verify` (CI also runs build, test,
   and `verify:package` on Node 20, 22, and 24), update `CHANGELOG.md`, and
-  review any `api-surface.json` diff.
-- Rollback: this is a dev-time library with no stored state. Pin consumers
-  to the previous git tag or version.
+  review any `api-surface.json` diff, then `npm publish`.
+- Rollback: npm allows `npm unpublish` only within 72 hours of publishing;
+  after that, publish a fixed patch version instead. This is a dev-time
+  library with no stored state, so there is nothing else to roll back.
