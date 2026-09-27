@@ -1,0 +1,7 @@
+{
+  "payout-invariance-kit": [
+    "assertNoPayoutImports",
+    "assertPayoutInvariance",
+    "deepEqual"
+  ]
+}

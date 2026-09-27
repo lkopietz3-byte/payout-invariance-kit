@@ -12,5 +12,5 @@
     "noUncheckedIndexedAccess": true,
     "outDir": "dist"
   },
-  "include": ["src", "examples"]
+  "include": ["src", "examples", "test"]
 }
