@@ -39,11 +39,11 @@ wire them into vitest, jest, `node:test`, or a plain script.
 
 ## Install
 
-Not yet published to npm. Install from GitHub until it is:
-
 ```bash
-npm install --save-dev github:lkopietz3-byte/payout-invariance-kit vitest
+npm install --save-dev payout-invariance-kit vitest
 ```
+
+Or build from source: clone the repository and run `npm install && npm run build`.
 
 Requires Node 20 or later. ESM only. Zero runtime dependencies —
 `dependencies: {}` in package.json. `assertNoPayoutImports`'s file-path mode
