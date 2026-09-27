@@ -1,6 +1,6 @@
 {
   "name": "payout-invariance-kit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Check whether a ranking/recommendation/comparison engine's output changes based on which option pays the operator more — a runtime mutation check plus a static import check, both framework-agnostic.",
   "keywords": [
     "affiliate-neutrality",
@@ -28,7 +28,8 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     }
   },
   "sideEffects": false,
