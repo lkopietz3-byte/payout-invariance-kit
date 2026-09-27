@@ -25,13 +25,6 @@
  * adapter examples.
  */
 
-// Only used by assertNoPayoutImports' file-path mode (reading files off
-// disk). This is a Node built-in, not a third-party package, so the
-// "zero runtime dependencies" promise (no npm dependencies) still holds.
-// If you only ever use the path -> content map form of assertNoPayoutImports,
-// this import is never called.
-import { readFileSync } from "node:fs";
-
 import { deepEqual } from "./deepEqual.js";
 import { snapshot } from "./snapshot.js";
 
@@ -459,10 +452,39 @@ function stripCommentLines(src: string): string {
     .join("\n");
 }
 
+/**
+ * Load Node's built-in `fs` module lazily, without a static top-level
+ * `import ... from "node:fs"` anywhere in this file. A static import of a
+ * Node built-in is resolved at BUNDLE time, not at call time — bundlers
+ * targeting a browser or a Workers runtime (which have no `fs`) fail to
+ * resolve it even for callers who never invoke the file-path mode below.
+ * `process.getBuiltinModule` (Node >=20.16, >=22.3) is a plain property
+ * lookup at runtime, invisible to static bundler analysis, so only callers
+ * who actually reach this function need Node's `fs` to exist at all.
+ */
+function loadNodeFs(): typeof import("node:fs") {
+  if (typeof process === "undefined" || typeof process.getBuiltinModule !== "function") {
+    throw new Error(
+      "assertNoPayoutImports: reading files by path requires Node's process.getBuiltinModule " +
+        "(Node >=20.16.0 or >=22.3.0), which isn't available in this runtime. Pass a pre-loaded " +
+        '{ path: content } map instead of an array of paths — see README.md, "Option B".',
+    );
+  }
+  const fs = process.getBuiltinModule("node:fs") as typeof import("node:fs") | undefined;
+  if (!fs) {
+    throw new Error(
+      "assertNoPayoutImports: node:fs is not available in this runtime (not Node, or fs was " +
+        'disabled). Pass a pre-loaded { path: content } map instead — see README.md, "Option B".',
+    );
+  }
+  return fs;
+}
+
 function normalizeToMap(files: SourceFiles): Record<string, string> {
   if (Array.isArray(files)) {
     // Only this branch (file-path list) touches the filesystem. The
-    // map-of-content form below never calls readFileSync.
+    // map-of-content form below never loads node:fs at all.
+    const { readFileSync } = loadNodeFs();
     const map: Record<string, string> = {};
     for (const path of files) {
       map[path] = readFileSync(path, "utf8");
