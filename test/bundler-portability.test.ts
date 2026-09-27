@@ -34,7 +34,7 @@ describe("bundler portability: node:fs is never imported at the top level", () =
   });
 
   it("gives a clear error, not a raw ReferenceError, when process.getBuiltinModule is unavailable", () => {
-    const original = process.getBuiltinModule;
+    const original = process.getBuiltinModule.bind(process);
     // Simulate a runtime without this Node 20.16+/22.3+ API (an older Node,
     // or a non-Node runtime that still defines `process` partially).
     // @ts-expect-error -- deleting a real method to simulate its absence
@@ -49,7 +49,7 @@ describe("bundler portability: node:fs is never imported at the top level", () =
   });
 
   it("the map mode never needs node:fs at all, even when process.getBuiltinModule is unavailable", () => {
-    const original = process.getBuiltinModule;
+    const original = process.getBuiltinModule.bind(process);
     // @ts-expect-error -- deleting a real method to simulate its absence
     delete process.getBuiltinModule;
     try {
