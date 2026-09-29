@@ -12,8 +12,13 @@
  *   only inherits from a built-in prototype;
  * - built-ins disguised so that isDeepStrictEqual reads the disguise: an own
  *   masked Symbol.toStringTag, a replaced prototype, own size/iterator
- *   overrides on a Map, an own `source` getter on a RegExp. deepEqual reads
- *   the real content.
+ *   overrides on a Map, an own `source` getter on a RegExp, and (on Node 20
+ *   and 22) an own `byteLength` getter on a DataView. deepEqual reads the
+ *   real content.
+ * Node versions differ in one more way: Node 20 and 22 report two invalid
+ * Dates as unequal, while deepEqual (and newer Node) treats them as equal.
+ * The generator does not produce invalid Dates, so the exact-agreement run
+ * holds on every supported Node version.
  * The only divergence in the other direction was an `arguments` object
  * against a plain object with the same entries; deepEqual now tells them
  * apart too.
@@ -183,6 +188,7 @@ function hostileValue(g: Gen): unknown {
     case 5:
       return hide(new Uint8Array([int(g)]), "length", { value: 0 });
     case 6:
+      g.disguised = true; // Node 20 and 22 read this own byteLength; Node 24+ does not
       return hide(new DataView(new Uint8Array([int(g)]).buffer), "byteLength", { get: () => 0 });
     case 7:
       g.disguised = true;
