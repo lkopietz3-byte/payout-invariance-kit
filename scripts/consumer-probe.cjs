@@ -20,6 +20,7 @@ assert.deepEqual(result.baseline, { topId: 'a' });
 
 const offenses = assertNoPayoutImports({ 'a.ts': 'const commission = 1;' }, ['commission']);
 assert.equal(offenses.length, 1);
+assert.throws(() => assertNoPayoutImports({}, ['commission']), TypeError);
 
 assert.equal(deepEqual({ a: 1 }, { a: 1 }), true);
 assert.equal(deepEqual({ a: 1 }, { a: 2 }), false);

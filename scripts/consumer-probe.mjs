@@ -117,4 +117,28 @@ assert.equal(deepEqual(new Set([{ a: 1 }, { a: 1 }]), new Set([{ a: 1 }, { a: 2 
 assert.equal(deepEqual(new Error('a'), new Error('b')), false);
 assert.equal(deepEqual(new Uint8Array([1, 2]), new Int8Array([1, 2])), false);
 
+// --- 0.2.0: brand checks, metadata, dense scenarios, strict static scope ---
+const masked = (payout) =>
+  Object.defineProperty(new Map([['rank', payout]]), Symbol.toStringTag, { value: undefined, enumerable: true });
+assert.equal(deepEqual(masked(0), masked(100)), false);
+assert.equal(
+  assertPayoutInvariance((input) => masked(input.payout), { payout: 0 }, [
+    { name: 'payout rises', mutate: (input) => ({ ...input, payout: 100 }) },
+  ]).passed,
+  false,
+);
+assert.equal(deepEqual(Object.assign(new ArrayBuffer(1), { score: 0 }), Object.assign(new ArrayBuffer(1), { score: 1 })), false);
+const annotated = Object.assign(new Uint8Array([1, 2]), { label: 'quality' });
+assert.equal(
+  assertPayoutInvariance((input) => input.items[0], { payout: 0, items: annotated }, [
+    { name: 'payout rises', mutate: (input) => ({ ...input, payout: 100 }) },
+  ]).passed,
+  true,
+);
+assert.throws(() => assertPayoutInvariance((x) => x, 1, new Array(1)), TypeError);
+assert.equal(assertNoPayoutImports({ 'a.ts': 'return/* x */commission;' }, ['commission']).length, 1);
+assert.throws(() => assertNoPayoutImports({}, ['commission']), TypeError);
+assert.throws(() => assertNoPayoutImports({ 'a.ts': 'x' }, []), TypeError);
+assert.throws(() => assertNoPayoutImports({ 'a.ts': 'x' }, ['\u200B']), TypeError);
+
 console.log('consumer probe passed');
