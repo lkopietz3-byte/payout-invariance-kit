@@ -5,18 +5,27 @@
 1. `assertPayoutInvariance` returns `passed: true` only if every mutation
    scenario changed the input and every changed input produced a ranking
    result equal to the baseline.
-2. A run that cannot be trusted throws instead of returning a result: empty
-   or malformed `mutations`, a non-function `rankFn`, `rankFn`/`mutate`
-   throwing or returning a Promise, non-boolean `isEqual`/`hasChanged`
-   results, or in-place changes to `baseInput` or the baseline result.
+2. A run that cannot be trusted throws instead of returning a result: empty,
+   sparse or malformed `mutations`, a non-function `rankFn`, `opts` that is
+   not a plain object or has non-function hooks, `rankFn`/`mutate` throwing
+   or returning a Promise, non-boolean `isEqual`/`hasChanged` results, or
+   in-place changes to `baseInput` or the baseline result. `mutations` is
+   validated with one indexed pass and the run uses only that snapshot.
 3. The library never writes to caller values and uses no randomness or
-   clock.
+   clock. Caller text in error messages is escaped.
 4. `deepEqual` fails closed: values it cannot inspect are equal only to
-   themselves. Built-ins are recognized by brand checks, not
-   `Symbol.toStringTag`.
+   themselves. Built-ins are recognized by intrinsic brand checks and their
+   content (including own enumerable metadata on buffers and views) is read
+   through intrinsics, never through `Symbol.toStringTag` or the value's own
+   methods. The internal snapshot copies everything `deepEqual` compares for
+   the kinds it copies. `src/deepEqual.ts` and `src/snapshot.ts` are
+   byte-identical to mutation-invariance-kit's copies; a differential fuzz
+   test checks `deepEqual` against `node:util`'s `isDeepStrictEqual` (in the
+   test only) and documents every divergence.
 5. `assertNoPayoutImports` is a text-pattern grep, not a parser: it never
    evaluates or imports the files it scans, and it does not follow the
-   import graph.
+   import graph. An empty scope (no files or no identifiers) or a blank
+   identifier throws a `TypeError` rather than returning a clean `[]`.
 6. Zero runtime dependencies (`dependencies` stays empty).
 
 ## Setup and verification
@@ -43,15 +52,20 @@ has a regression test that failed against the pre-fix commit.
   independence from payout in general.
 - Not a fairness audit, legal or regulatory compliance evidence, or a
   security control.
-- Performance is not benchmarked. Each `assertPayoutInvariance` run
+- Performance is measured only roughly. Each `assertPayoutInvariance` run
   deep-copies `baseInput` and the baseline result and compares them after
-  each call; `deepEqual`'s object `Set`/`Map` matching is quadratic in the
+  each call. `deepEqual` brand-checks each object once (about 15 to 25
+  microseconds per new object on Node 26, measured on 40,000 objects) and
+  caches the result; its object `Set`/`Map` matching is quadratic in the
   number of object members.
 - In-place change detection does not see inside values kept by reference
-  (functions, `Error`, `Promise`, private fields).
+  (functions, `Error`, boxed primitives, `DataView`, `SharedArrayBuffer`,
+  `Promise`, private fields).
+- A `Promise` whose prototype was replaced is compared as an ordinary
+  object; there is no side-effect-free brand check for promises.
 - `assertNoPayoutImports`'s same-line string tracking is not carried across
-  a line break, so a genuinely multi-line string or template literal can
-  hide a `//`/`/*` sequence from the wrong side of the check.
+  a line break, and a regular-expression literal containing `/*` or `//` is
+  mistaken for a comment start, so either can hide code from the check.
 
 ## Are the types wrong? (attw)
 
@@ -71,8 +85,11 @@ points).
 publish via the `prepublishOnly` script, so a broken build cannot reach the registry by
 accident. To release: add a dated entry to `CHANGELOG.md`, bump `version` in
 `package.json`, commit, and push a `vX.Y.Z` tag that matches the new version, then let
-`.github/workflows/release.yml` install, verify, and publish it. (You can also run
-`npm publish` locally; `prepublishOnly` still guards it.)
+`.github/workflows/release.yml` publish it. The workflow runs only on a `v*` tag whose
+version matches `package.json` (a manual dispatch from a branch fails), and runs the
+dependency audit, `npm run verify` and `npm run attw` before publishing. Only a confirmed
+E404 from the registry counts as "not published yet"; any other registry error fails the
+job. (You can also run `npm publish` locally; `prepublishOnly` still guards it.)
 
 npm's unpublish policy is deliberately narrow. Within 72 hours of publishing, a version can be
 unpublished only if no other published package depends on it. After 72 hours, unpublishing also
@@ -93,7 +110,8 @@ This is a dev-time library with no stored state, so there is nothing else to rol
   regressions, but that runtime gets no security fixes upstream; don't run production traffic
   on it.
 - CommonJS `require()` of this package needs Node >=20.19 or >=22.12 (`require(esm)`
-  support). ESM `import` works on every version this package tests (20, 22, 24).
+  support). The `compat` job pins exactly 20.19.0 and 22.12.0 (plus the latest 20, 22 and
+  24) and runs the tests and the installed-package checks, including the CommonJS probe.
 - `engines` in `package.json` is unchanged by this policy.
 
 ### Publishing with provenance

@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-09-29
+
+Some inputs that 0.1.1 accepted now throw, and some comparisons now give a
+different (stricter) answer, so this is a minor release.
+
+### Fixed
+
+- `deepEqual` recognized built-ins by `Symbol.toStringTag` first, so a real
+  `Map` with an own masked tag was compared as an empty ordinary object and
+  a ranker returning different masked Maps passed (PIK-001). Built-ins are
+  now recognized by intrinsic brand checks and their content is read
+  through intrinsics, so an overridden `getTime`, `valueOf`, `size`,
+  iterator, `byteLength` or `length` cannot hide a difference either. A
+  value that inherits from a built-in prototype without passing its brand
+  check (a `Proxy` around a `Map`, a masked `Promise`) is not comparable.
+- `ArrayBuffer`, `SharedArrayBuffer` and `DataView` now compare their own
+  enumerable properties, like every other kind.
+- The internal snapshot dropped typed-array metadata that `deepEqual`
+  compared, so an untouched `Uint8Array` with a `label` property was
+  reported as modified in place (PIK-004). It now keeps it (and
+  `ArrayBuffer` metadata).
+- An `arguments` object no longer equals a plain object with the same
+  entries.
+- `mutations` was validated with `forEach` and run with a spread copy: a
+  sparse array ran `rankFn` before failing, and an overridden
+  `Symbol.iterator` ran no scenarios. It is now validated with one indexed
+  pass (holes rejected), each `name` and `mutate` is read once, and the run
+  uses only that snapshot.
+- The comment stripper removed an inline block comment without leaving a
+  separator, so `return/* x */commission` became `returncommission` and the
+  reference was missed (PIK-002). A removed block comment now leaves a
+  space.
+- Error messages escape scenario names and thrown messages (newlines,
+  control and bidi characters), and a thrown value that cannot be printed
+  no longer breaks the message.
+
+### Changed
+
+- `assertNoPayoutImports` throws a `TypeError` for an empty `files` list or
+  map, an empty identifier list, a blank identifier, a hole, a non-string
+  and non-RegExp identifier, a `files` value that is not an array of paths
+  or a plain object, non-string content, or non-boolean options (PIK-005).
+  It used to return `[]`, which looked like a clean scan. RegExp
+  identifiers are copied through their internal slots.
+- `assertPayoutInvariance` throws a `TypeError` when `opts` is not a plain
+  object or `isEqual`/`hasChanged` is not a function, before `rankFn` runs.
+- The README async recipe is narrowed to a tested ranker that resolves to
+  an array of ids. The old helper ran every call before the library took
+  its snapshots, so a ranker reusing one output array passed (PIK-003).
+- Release workflow: runs only on a matching `v*` tag for both triggers,
+  runs the dependency audit, verify and attw, and treats only a confirmed
+  E404 as "not published". CI adds Node 20.19.0 and 22.12.0 compatibility
+  jobs.
+
+### Added
+
+- A differential fuzz test against `node:util`'s `isDeepStrictEqual` (test
+  only; the library does not import `node:util`), a runtime-portability
+  test (no `SharedArrayBuffer`, `WeakRef`, `FinalizationRegistry`,
+  `BigInt`, `Float16Array`; other realms; endless prototype chains), and an
+  ESM/CommonJS compatibility table in the README.
+
 ## [0.1.1] - 2026-09-27
 
 ### Added

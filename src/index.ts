@@ -56,6 +56,7 @@ export interface PayoutMutationScenario<TInput> {
   mutate: (baseInput: TInput) => TInput;
 }
 
+/** Optional hooks for `assertPayoutInvariance`. Pass a plain object; both hooks must be synchronous. */
 export interface AssertPayoutInvarianceOptions<TInput, TResult> {
   /**
    * How to compare two ranking results for equality. Defaults to a
@@ -86,6 +87,7 @@ export interface AssertPayoutInvarianceOptions<TInput, TResult> {
   hasChanged?: (baseInput: TInput, mutatedInput: TInput) => boolean;
 }
 
+/** One scenario whose ranking result differed from the baseline. */
 export interface PayoutInvarianceFailure<TInput, TResult> {
   /** The mutation scenario's name. */
   scenario: string;
@@ -97,6 +99,7 @@ export interface PayoutInvarianceFailure<TInput, TResult> {
   actual: TResult;
 }
 
+/** What `assertPayoutInvariance` returns when it could run every scenario. */
 export interface PayoutInvarianceResult<TInput, TResult> {
   /**
    * True only if every mutation scenario ran (none were vacuous) AND every
@@ -413,6 +416,7 @@ export function assertPayoutInvariance<TInput, TResult>(
  */
 export type SourceFiles = string[] | Record<string, string>;
 
+/** Options for `assertNoPayoutImports`. Pass a plain object with boolean flags. */
 export interface AssertNoPayoutImportsOptions {
   /**
    * Strip single-line comments (`// ...`) and `/* ... *\/` block comments
@@ -440,6 +444,7 @@ export interface AssertNoPayoutImportsOptions {
   caseInsensitive?: boolean;
 }
 
+/** One scanned file that references a forbidden identifier, with every matching line. */
 export interface PayoutImportOffense {
   /** The file path (or map key) that contains a forbidden reference. */
   file: string;

@@ -5,7 +5,7 @@ Mapped on **2026-09-26** from connected GitHub, Vercel, and Supabase metadata. T
 ## Identity and repository settings
 
 - Repository: [lkopietz3-byte/payout-invariance-kit](https://github.com/lkopietz3-byte/payout-invariance-kit)
-- Purpose: A pair of checks for whether payout data can influence a ranking or recommendation, at runtime and through static inspection.
+- Purpose: A pair of checks that look for payout influence on a ranking or recommendation in the scenarios and files you supply: a runtime mutation check and a static identifier scan. A pass covers only what was tested.
 - GitHub visibility: **public**; default branch: **`main`**; archived: **no**.
 - Product stage, owner, production health, and GitHub protection/settings beyond the fields above: **not verified**.
 
