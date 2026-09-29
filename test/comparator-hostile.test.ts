@@ -525,3 +525,38 @@ describe("mutation-testing survivors (edge cases the fixes must keep)", () => {
     expect(deepEqual(new Map([["a", undefined]]), new Map([["b", undefined]]))).toBe(false);
   });
 });
+
+describe("snapshot copies (mutation-testing survivors)", () => {
+  it("copies every typed-array element type, so an in-place edit to any of them is detected", () => {
+    const types = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array];
+    for (const Typed of types) {
+      const value = new Typed([1, 2]);
+      const copy = snapshot(value);
+      expect(copy, Typed.name).not.toBe(value);
+      value[0] = 3;
+      expect(deepEqual(copy, value), Typed.name).toBe(false);
+    }
+    for (const Typed of [BigInt64Array, BigUint64Array]) {
+      const value = new Typed([1n]);
+      const copy = snapshot(value);
+      value[0] = 2n;
+      expect(deepEqual(copy, value), Typed.name).toBe(false);
+    }
+    const Float16 = Reflect.get(globalThis, "Float16Array") as (new (values: number[]) => Float32Array) | undefined;
+    if (Float16) {
+      const value = new Float16([1]);
+      const copy = snapshot(value);
+      value[0] = 2;
+      expect(deepEqual(copy, value)).toBe(false);
+    }
+  });
+
+  it("keeps a RegExp's lastIndex and an array's trailing holes in the copy", () => {
+    const regexp = /a/g;
+    regexp.lastIndex = 3;
+    expect(deepEqual(snapshot(regexp), regexp)).toBe(true);
+    // eslint-disable-next-line no-sparse-arrays -- a trailing hole is the point of this case
+    const holey = [1, , ,];
+    expect(deepEqual(snapshot(holey), holey)).toBe(true);
+  });
+});
