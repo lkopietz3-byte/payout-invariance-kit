@@ -177,12 +177,12 @@ type Brand = "Map" | "Set" | "ArrayBuffer" | "SharedArrayBuffer" | "Date" | "Reg
  */
 const brandCache = new WeakMap<object, Brand>();
 
+/** Kinds whose brand comes from an internal slot (the rest have brand "None"). */
+const slotBrands = new Set<Kind>(["Map", "Set", "ArrayBuffer", "SharedArrayBuffer", "Date", "RegExp", "Boxed"]);
+
 /** Internal. Record the brand of a value this package just created. */
 export function registerBrand(value: object, kind: Kind): void {
-  if (kind === "Object" || kind === "Arguments" || kind === "Array" || kind === "TypedArray") {
-    brandCache.set(value, "None");
-  }
-  else if (kind !== "Error" && kind !== "DataView") brandCache.set(value, kind);
+  brandCache.set(value, slotBrands.has(kind) ? (kind as Brand) : "None");
 }
 
 /**
@@ -264,10 +264,8 @@ function classifyByChain(value: object): "Error" | "Opaque" | undefined {
 
 function classify(value: object): Kind {
   if (Array.isArray(value)) return "Array";
-  if (ArrayBuffer.isView(value)) {
-    if (typeof typedArrayTag(value) === "string") return "TypedArray";
-    return passes(dataViewBuffer, value) ? "DataView" : "Opaque";
-  }
+  // The only views are typed arrays and DataViews.
+  if (ArrayBuffer.isView(value)) return typeof typedArrayTag(value) === "string" ? "TypedArray" : "DataView";
   const brand = brandOf(value);
   if (brand !== "None") return brand;
   const byChain = classifyByChain(value);

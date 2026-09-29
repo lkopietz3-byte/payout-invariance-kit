@@ -279,7 +279,7 @@ export function assertPayoutInvariance<TInput, TResult>(
   rankFn: (input: TInput) => TResult,
   baseInput: TInput,
   mutations: PayoutMutationScenario<TInput>[],
-  opts: AssertPayoutInvarianceOptions<TInput, TResult> = {},
+  opts?: AssertPayoutInvarianceOptions<TInput, TResult>,
 ): PayoutInvarianceResult<TInput, TResult> {
   if (typeof rankFn !== "function") {
     throw new TypeError("assertPayoutInvariance: rankFn must be a function.");
@@ -696,7 +696,7 @@ function readSourceFiles(files: unknown): [string, string][] {
 export function assertNoPayoutImports(
   files: SourceFiles,
   payoutIdentifiers: (string | RegExp)[],
-  opts: AssertNoPayoutImportsOptions = {},
+  opts?: AssertNoPayoutImportsOptions,
 ): PayoutImportOffense[] {
   const { stripComments, caseInsensitive } = readScanOptions(opts);
   const matchers = readMatchers(payoutIdentifiers, caseInsensitive);

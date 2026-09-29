@@ -256,3 +256,34 @@ describe("assertNoPayoutImports: an empty or malformed scope is an error, not a 
     ]);
   });
 });
+
+describe("remaining branches (tests audit)", () => {
+  it("names the index of a non-object scenario", () => {
+    for (const bad of [1, null, "x"]) {
+      expect(() => assertPayoutInvariance((x: number) => x, 1, [bad as never])).toThrow(
+        /mutations\[0\] must be an object with a string "name"/,
+      );
+    }
+  });
+
+  it("names null as the bad hook result", () => {
+    expect(() =>
+      assertPayoutInvariance((input: Input) => input.payout, { payout: 0 }, [bump], { hasChanged: () => null as never }),
+    ).toThrow(/hasChanged must return a boolean, got null/);
+  });
+
+  it("explains a runtime where getBuiltinModule cannot provide node:fs", () => {
+    const original = process.getBuiltinModule.bind(process);
+    process.getBuiltinModule = () => undefined;
+    try {
+      expect(() => assertNoPayoutImports(["some/file.ts"], ["commission"])).toThrow(/node:fs is not available/);
+    } finally {
+      process.getBuiltinModule = original;
+    }
+  });
+
+  it("keeps a RegExp identifier's existing g flag", () => {
+    const files = { "a.ts": "const commission = 1;\nconst x = commission;" };
+    expect(assertNoPayoutImports(files, [/commission/g])[0]?.matches.map((match) => match.line)).toEqual([1, 2]);
+  });
+});
