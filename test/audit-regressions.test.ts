@@ -287,3 +287,70 @@ describe("remaining branches (tests audit)", () => {
     expect(assertNoPayoutImports(files, [/commission/g])[0]?.matches.map((match) => match.line)).toEqual([1, 2]);
   });
 });
+
+describe("mutation-testing survivors (index.ts)", () => {
+  const rank = (input: Input): number => input.payout;
+
+  it("rejects a class instance as opts or as the files record", () => {
+    class Options {
+      isEqual = (): boolean => true;
+    }
+    expect(() => assertPayoutInvariance(rank, { payout: 0 }, [bump], new Options() as never)).toThrow(
+      /opts must be a plain object/,
+    );
+    class Files {
+      "a.ts" = "commission";
+    }
+    expect(() => assertNoPayoutImports(new Files() as never, ["commission"])).toThrow(/files must be an array of paths/);
+  });
+
+  it("escapes quotes and backslashes inside a quoted scenario name", () => {
+    const named = { name: 'say "hi" \\ bye', mutate: (): Input => { throw new Error("x"); } };
+    expect(() => assertPayoutInvariance(rank, { payout: 0 }, [named])).toThrow(
+      String.raw`scenario "say \"hi\" \\ bye": mutate() threw: x`,
+    );
+  });
+
+  it("gives exact messages for a Promise-returning hook, rankFn and mutate", () => {
+    expect(() => assertPayoutInvariance(rank, { payout: 0 }, [bump], { isEqual: () => Promise.resolve(true) as never })).toThrow(
+      'assertPayoutInvariance: isEqual must return a boolean, got a Promise (or thenable) for scenario "payout rises".',
+    );
+    expect(() => assertPayoutInvariance(rank, { payout: 0 }, [bump], { hasChanged: () => 1 as never })).toThrow(
+      'assertPayoutInvariance: hasChanged must return a boolean, got number for scenario "payout rises".',
+    );
+    const asyncOnMutated = (input: Input): unknown => (input.payout === 0 ? 0 : Promise.resolve(1));
+    expect(() => assertPayoutInvariance(asyncOnMutated as (input: Input) => number, { payout: 0 }, [bump])).toThrow(
+      'rankFn returned a Promise (or thenable) on the mutated input for scenario "payout rises" (it did not throw on the baseline input).',
+    );
+    const reusing = (() => {
+      const out = { v: 0 };
+      return (input: Input) => {
+        out.v = input.payout;
+        return out;
+      };
+    })();
+    expect(() => assertPayoutInvariance(reusing, { payout: 0 }, [bump])).toThrow(
+      'assertPayoutInvariance: rankFn modified its earlier (baseline) result in place during scenario "payout rises". ' +
+        "Return a fresh value from every call, or the baseline can no longer be compared.",
+    );
+    const editing = { name: "edits", mutate: (input: Input): Input => { input.payout = 5; return { payout: 6 }; } };
+    expect(() => assertPayoutInvariance(rank, { payout: 0 }, [editing])).toThrow(
+      'assertPayoutInvariance: scenario "edits": mutate() modified baseInput in place.',
+    );
+  });
+
+  it("matches a plain identifier literally, even with regex characters in it", () => {
+    expect(assertNoPayoutImports({ "a.ts": "const payXout = 1;" }, ["pay.out"])).toEqual([]);
+    expect(assertNoPayoutImports({ "a.ts": "import x from './pay.out';" }, ["pay.out"])).toHaveLength(1);
+  });
+
+  it("tracks escapes and every quote style, and does not treat division as a comment", () => {
+    const lines = [
+      String.raw`const s = "x\"//"; const c = commission;`,
+      "const u = 'https://x/'; const c = commission;",
+      "const t = `https://x/`; const c = commission;",
+      "const r = a / b; const c = commission;",
+    ];
+    for (const line of lines) expect(assertNoPayoutImports({ "a.ts": line }, ["commission"]), line).toHaveLength(1);
+  });
+});

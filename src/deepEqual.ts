@@ -125,9 +125,9 @@ const hasOwnProperty = methodOf(Object.prototype, "hasOwnProperty") as Intrinsic
 
 /**
  * Prototypes of built-ins whose state lives in internal slots. A value that
- * inherits from one of these but fails its brand check (a Proxy around a
- * Map, `Object.create(Date.prototype)`, a Promise, which has no side-effect
- * free brand check) is not comparable.
+ * is one of these prototypes, or inherits from one but fails its brand check
+ * (a Proxy around a Map, `Object.create(Date.prototype)`, a Promise, which
+ * has no side-effect free brand check) is not comparable.
  */
 const slotPrototypes = new Set<object>(
   [
@@ -252,7 +252,7 @@ function classifyByChain(value: object): "Error" | "Opaque" | undefined {
     depth += 1;
     if (depth > MAX_PROTOTYPE_CHAIN) return "Opaque";
     if (object === ErrorPrototype) isError = true;
-    if (object !== value && slotPrototypes.has(object)) notComparable = true;
+    if (slotPrototypes.has(object)) notComparable = true;
     const tag = Object.getOwnPropertyDescriptor(object, Symbol.toStringTag);
     if (tag !== undefined && (typeof tag.value === "string" || tag.get !== undefined || tag.set !== undefined)) {
       notComparable = true;
@@ -440,9 +440,10 @@ function isIdentityKey(value: unknown): boolean {
  * `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`, `Promise`, a
  * `DataView` whose buffer was detached, any object that has its own or an
  * inherited string `Symbol.toStringTag` without being one of the built-ins
- * above (`URL`, some decimal and date library classes), any object that
- * inherits from a built-in's prototype without being that built-in (a
- * `Proxy` around a `Map`, `Object.create(Date.prototype)`), and any object
+ * above (`URL`, some decimal and date library classes), a built-in's
+ * prototype object itself (`Date.prototype`), any object that inherits from
+ * a built-in's prototype without being that built-in (a `Proxy` around a
+ * `Map`, `Object.create(Date.prototype)`), and any object
  * whose classification throws (a revoked `Proxy`). Compare those with a
  * custom `isEqual`.
  *

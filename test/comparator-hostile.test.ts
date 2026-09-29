@@ -463,3 +463,65 @@ describe("arguments objects", () => {
     expect(deepEqual(copy, value)).toBe(false);
   });
 });
+
+describe("mutation-testing survivors (edge cases the fixes must keep)", () => {
+  it("treats built-in prototype objects as not comparable (RegExp.prototype answers `source` but is not a RegExp)", () => {
+    expect(snapshot({ p: RegExp.prototype }).p).toBe(RegExp.prototype);
+    expect(deepEqual(RegExp.prototype, {})).toBe(false);
+    expect(deepEqual(Date.prototype, {})).toBe(false);
+    expect(deepEqual(RegExp.prototype, RegExp.prototype)).toBe(true);
+  });
+
+  it("compares an Error subclass with its own tag getter as an Error", () => {
+    class TaggedError extends Error {
+      get [Symbol.toStringTag](): string {
+        return "Tagged";
+      }
+    }
+    expect(deepEqual(new TaggedError("a"), new TaggedError("a"))).toBe(true);
+    expect(deepEqual(new TaggedError("a"), new TaggedError("b"))).toBe(false);
+  });
+
+  it("does not treat an own undefined Symbol.toStringTag as a custom tag", () => {
+    const tagless = (): object => ({ [Symbol.toStringTag]: undefined, a: 1 });
+    expect(deepEqual(tagless(), tagless())).toBe(true);
+    const setterOnly = (): object => Object.defineProperty({}, Symbol.toStringTag, { set: () => undefined });
+    expect(deepEqual(setterOnly(), setterOnly())).toBe(false);
+  });
+
+  it("does not treat objects that only inherit from RegExp, Number, String or Boolean prototypes as comparable", () => {
+    for (const proto of [RegExp.prototype, Number.prototype, String.prototype, Boolean.prototype]) {
+      expect(deepEqual(Object.create(proto), Object.create(proto)), String(proto)).toBe(false);
+    }
+  });
+
+  it("compares array length, so a trailing hole is a difference", () => {
+    // eslint-disable-next-line no-sparse-arrays -- a trailing hole is the point of this case
+    expect(deepEqual([1, ,], [1])).toBe(false);
+  });
+
+  it("treats only canonical index keys as typed-array elements", () => {
+    for (const key of ["01", "a1", "1a", "1e0"]) {
+      const a = Object.defineProperty(new Uint8Array(2), key, { value: 1, enumerable: true });
+      const b = Object.defineProperty(new Uint8Array(2), key, { value: 2, enumerable: true });
+      expect(deepEqual(a, b), key).toBe(false);
+    }
+  });
+
+  it("returns false, not a TypeError, when only the second DataView is detached", () => {
+    const buffer = new ArrayBuffer(1);
+    const view = new DataView(buffer);
+    detach(buffer);
+    expect(deepEqual(new DataView(new ArrayBuffer(0)), view)).toBe(false);
+  });
+
+  it("compares typed-array element types even when the prototypes were made equal", () => {
+    const disguised = Object.setPrototypeOf(new Int8Array([1]), Uint8Array.prototype) as Uint8Array;
+    expect(deepEqual(disguised, new Uint8Array([1]))).toBe(false);
+  });
+
+  it("requires every key of one side to be an own enumerable key of the other", () => {
+    expect(deepEqual({ x: undefined }, { y: undefined })).toBe(false);
+    expect(deepEqual(new Map([["a", undefined]]), new Map([["b", undefined]]))).toBe(false);
+  });
+});
