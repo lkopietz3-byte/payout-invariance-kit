@@ -25,7 +25,7 @@
  * adapter examples.
  */
 
-import { deepEqual } from "./deepEqual.js";
+import { deepEqual, kindOf, regExpParts } from "./deepEqual.js";
 import { snapshot } from "./snapshot.js";
 
 export { deepEqual };
@@ -127,37 +127,109 @@ function isThenable(value: unknown): boolean {
   );
 }
 
+const SHORT_ESCAPES = new Map([
+  ["\n", "\\n"],
+  ["\r", "\\r"],
+  ["\t", "\\t"],
+]);
+
+/**
+ * Escape control characters, line and paragraph separators, and bidi
+ * formatting characters, so caller text inside an error message cannot start
+ * a fake new line, reorder what a reader sees, or send a terminal escape.
+ */
+function escapeText(text: string): string {
+  return text.replace(
+    /[\p{Cc}\p{Bidi_Control}\u2028\u2029]/gu,
+    (ch) => SHORT_ESCAPES.get(ch) ?? `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+/** A caller string as a quoted, escaped label for an error message. */
+function quote(text: string): string {
+  return `"${escapeText(text.replace(/["\\]/g, "\\$&"))}"`;
+}
+
+/** A thrown value's message, escaped; never throws itself. */
 function describeError(error: unknown): string {
   try {
-    return error instanceof Error ? error.message : String(error);
+    return escapeText(error instanceof Error ? String(error.message) : String(error));
   } catch {
     return "(unprintable thrown value)";
   }
 }
 
-function validateMutations<TInput>(mutations: unknown): PayoutMutationScenario<TInput>[] {
+const hasOwn = (object: object, key: PropertyKey): boolean => Object.prototype.hasOwnProperty.call(object, key);
+
+/** Only a plain `{}` or `Object.create(null)` object counts as an options or content record. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || kindOf(value) !== "Object") return false;
+  const proto = Object.getPrototypeOf(value) as unknown;
+  return proto === Object.prototype || proto === null;
+}
+
+/** Blank means only whitespace and default-ignorable characters (zero-width and bidi formatting marks). */
+function isBlank(text: string): boolean {
+  return /^[\s\p{Default_Ignorable_Code_Point}]*$/u.test(text);
+}
+
+/**
+ * Validate `mutations` with one indexed pass (holes rejected, inherited
+ * elements ignored), reading each scenario's `name` and `mutate` exactly
+ * once, and return that snapshot. The run uses only this snapshot, so what
+ * was validated is exactly what runs, whatever the array's iterator or the
+ * scenario's getters do later.
+ */
+function snapshotMutations<TInput>(mutations: unknown): PayoutMutationScenario<TInput>[] {
   if (!Array.isArray(mutations)) {
     throw new TypeError("assertPayoutInvariance: mutations must be an array of { name, mutate } objects.");
   }
-  if (mutations.length === 0) {
+  const length = mutations.length;
+  if (length === 0) {
     throw new Error(
       "assertPayoutInvariance: mutations is empty, so nothing would be tested. Pass at least one scenario.",
     );
   }
-  mutations.forEach((scenario: unknown, index) => {
-    const candidate = scenario as Partial<PayoutMutationScenario<TInput>> | null;
-    if (
-      typeof candidate !== "object" ||
-      candidate === null ||
-      typeof candidate.name !== "string" ||
-      typeof candidate.mutate !== "function"
-    ) {
+  const list: PayoutMutationScenario<TInput>[] = [];
+  for (let index = 0; index < length; index += 1) {
+    if (!hasOwn(mutations, index)) {
+      throw new TypeError(
+        `assertPayoutInvariance: mutations[${index}] is missing (a hole in a sparse array). Pass a dense array.`,
+      );
+    }
+    const candidate: unknown = mutations[index];
+    const name: unknown = typeof candidate === "object" && candidate !== null ? Reflect.get(candidate, "name") : undefined;
+    const mutate: unknown =
+      typeof candidate === "object" && candidate !== null ? Reflect.get(candidate, "mutate") : undefined;
+    if (typeof name !== "string" || typeof mutate !== "function") {
       throw new TypeError(
         `assertPayoutInvariance: mutations[${index}] must be an object with a string "name" and a "mutate" function.`,
       );
     }
-  });
-  return [...(mutations as PayoutMutationScenario<TInput>[])];
+    list.push({ name, mutate: mutate as (baseInput: TInput) => TInput });
+  }
+  return list;
+}
+
+type Hook = ((...args: never[]) => unknown) | undefined;
+
+/** Read `opts` once: undefined or a plain object whose hooks are functions or undefined. */
+function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook } {
+  if (opts === undefined) return { isEqual: undefined, hasChanged: undefined };
+  if (!isPlainRecord(opts)) {
+    throw new TypeError("assertPayoutInvariance: opts must be a plain object (or omitted).");
+  }
+  const isEqual = opts.isEqual;
+  const hasChanged = opts.hasChanged;
+  for (const [hook, value] of [
+    ["isEqual", isEqual],
+    ["hasChanged", hasChanged],
+  ] as const) {
+    if (value !== undefined && typeof value !== "function") {
+      throw new TypeError(`assertPayoutInvariance: opts.${hook} must be a function (or omitted).`);
+    }
+  }
+  return { isEqual: isEqual as Hook, hasChanged: hasChanged as Hook };
 }
 
 /**
@@ -173,12 +245,21 @@ function validateMutations<TInput>(mutations: unknown): PayoutMutationScenario<T
  * framework's `expect()`, so it works with any test runner (or none). See
  * README.md for a vitest adapter example.
  *
+ * `mutations` is validated and copied with one indexed pass before
+ * anything runs: each scenario's `name` and `mutate` are read once, and the
+ * run uses only that copy, so the scenarios that were checked are exactly
+ * the scenarios that run.
+ *
  * Throws, rather than returning a result, when the run cannot be trusted:
- * - `rankFn` is not a function, or `mutations` is not a non-empty array of
- *   `{ name, mutate }` (checked before anything runs).
+ * - `rankFn` is not a function, `mutations` is not a non-empty, dense array
+ *   of `{ name, mutate }` (a hole in a sparse array is rejected), or `opts`
+ *   is not a plain object whose `isEqual`/`hasChanged` are functions or
+ *   undefined (all checked before anything runs).
  * - `rankFn` throws on the baseline or on a mutated input, or `mutate`
  *   throws. The error names the scenario and keeps the original error as
- *   `cause`.
+ *   `cause`. Scenario names and thrown messages are escaped in the text
+ *   (newlines, control and bidi characters), so they cannot fake extra
+ *   lines of output.
  * - `rankFn` or `mutate` returns a Promise (or any thenable). This function
  *   is synchronous; awaiting inside `rankFn`/`mutate` and passing the
  *   resolved value in is the fix — see README.md, "Async ranking functions".
@@ -203,9 +284,12 @@ export function assertPayoutInvariance<TInput, TResult>(
   if (typeof rankFn !== "function") {
     throw new TypeError("assertPayoutInvariance: rankFn must be a function.");
   }
-  const list = validateMutations<TInput>(mutations);
-  const isEqual = opts.isEqual ?? deepEqual;
-  const hasChanged = opts.hasChanged ?? ((base, mutated) => !deepEqual(base, mutated));
+  const list = snapshotMutations<TInput>(mutations);
+  const options = readRuntimeOptions(opts);
+  const isEqual = (options.isEqual as ((expected: TResult, actual: TResult) => unknown) | undefined) ?? deepEqual;
+  const hasChanged =
+    (options.hasChanged as ((base: TInput, mutated: TInput) => unknown) | undefined) ??
+    ((base: TInput, mutated: TInput) => !deepEqual(base, mutated));
 
   const pristineInput = snapshot(baseInput);
   const assertBaseUntouched = (who: string): void => {
@@ -267,46 +351,43 @@ export function assertPayoutInvariance<TInput, TResult>(
   const vacuous: string[] = [];
 
   for (const { name, mutate } of list) {
-    if (typeof mutate !== "function") {
-      throw new TypeError(`assertPayoutInvariance: scenario "${name}": mutate must be a function.`);
-    }
-
+    const label = `scenario ${quote(name)}`;
     let mutatedInput: TInput;
     try {
       mutatedInput = mutate(baseInput);
     } catch (error) {
-      throw new Error(`assertPayoutInvariance: scenario "${name}": mutate() threw: ${describeError(error)}`, {
+      throw new Error(`assertPayoutInvariance: ${label}: mutate() threw: ${describeError(error)}`, {
         cause: error,
       });
     }
     if (isThenable(mutatedInput)) {
       throw new TypeError(
-        `assertPayoutInvariance: scenario "${name}": mutate() returned a Promise (or thenable). mutate must ` +
+        `assertPayoutInvariance: ${label}: mutate() returned a Promise (or thenable). mutate must ` +
           `be synchronous.`,
       );
     }
-    assertBaseUntouched(`scenario "${name}": mutate()`);
+    assertBaseUntouched(`${label}: mutate()`);
 
     // Precondition guard: a mutation that changed nothing can't prove
     // invariance. Flag it instead of letting it silently count as a pass.
-    if (!checkedBoolean("hasChanged", `for scenario "${name}"`, hasChanged(baseInput, mutatedInput))) {
+    if (!checkedBoolean("hasChanged", `for ${label}`, hasChanged(baseInput, mutatedInput))) {
       vacuous.push(name);
       continue;
     }
 
     const actual = callRankFn(
       mutatedInput,
-      `on the mutated input for scenario "${name}" (it did not throw on the baseline input)`,
+      `on the mutated input for ${label} (it did not throw on the baseline input)`,
     );
-    assertBaseUntouched(`scenario "${name}": rankFn`);
+    assertBaseUntouched(`${label}: rankFn`);
     if (!deepEqual(baselineCopy, baseline)) {
       throw new Error(
-        `assertPayoutInvariance: rankFn modified its earlier (baseline) result in place during scenario ` +
-          `"${name}". Return a fresh value from every call, or the baseline can no longer be compared.`,
+        `assertPayoutInvariance: rankFn modified its earlier (baseline) result in place during ${label}. ` +
+          `Return a fresh value from every call, or the baseline can no longer be compared.`,
       );
     }
 
-    if (!checkedBoolean("isEqual", `for scenario "${name}"`, isEqual(baseline, actual))) {
+    if (!checkedBoolean("isEqual", `for ${label}`, isEqual(baseline, actual))) {
       failures.push({ scenario: name, mutatedInput, expected: baseline, actual });
     }
   }
@@ -334,14 +415,19 @@ export type SourceFiles = string[] | Record<string, string>;
 
 export interface AssertNoPayoutImportsOptions {
   /**
-   * Strip single-line comments (`// ...`) and whole lines that are part of
-   * a `/* ... *\/` block comment before matching, so a comment that merely
-   * MENTIONS a forbidden identifier doesn't count as a reference. String and
-   * template literals on the same line are tracked so a `//` inside one
-   * (e.g. `"https://example.com/payout"`) is not mistaken for the start of a
-   * line comment. This is still a best-effort, line-based strip (not a real
+   * Strip single-line comments (`// ...`) and `/* ... *\/` block comments
+   * before matching, so a comment that merely MENTIONS a forbidden
+   * identifier doesn't count as a reference. A removed block comment leaves
+   * a space behind, so `return/* x *\/commission` still shows `commission`
+   * as its own word, and line numbers stay the same. String and template
+   * literals on the same line are tracked so a `//` inside one (e.g.
+   * `"https://example.com/payout"`) is not mistaken for the start of a line
+   * comment. This is still a best-effort, line-based strip (not a real
    * parser) — see README.md "Honest limits": a string or template literal
-   * that itself spans multiple lines is not tracked across the line break.
+   * that spans multiple lines is not tracked across the line break, and a
+   * regular-expression literal containing `/*` or `//` (such as `/[/*]/`)
+   * is mistaken for the start of a comment, which can hide the code after
+   * it. Pass `false` for files like that. Must be a boolean when given.
    * Defaults to true.
    */
   stripComments?: boolean;
@@ -349,7 +435,7 @@ export interface AssertNoPayoutImportsOptions {
    * Case-insensitive matching for string identifiers (RegExp patterns are
    * used as-is; give them their own `i` flag if you want that). Defaults to
    * true, since missing a reference due to casing is worse than an
-   * occasional over-match.
+   * occasional over-match. Must be a boolean when given.
    */
   caseInsensitive?: boolean;
 }
@@ -370,12 +456,8 @@ function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Build a matcher regex for one identifier/pattern (word-boundary for plain strings). */
-function toMatcher(identifier: string | RegExp, caseInsensitive: boolean): RegExp {
-  if (identifier instanceof RegExp) {
-    const flags = identifier.flags.includes("g") ? identifier.flags : identifier.flags + "g";
-    return new RegExp(identifier.source, flags);
-  }
+/** Build a word-boundary matcher regex for one plain-string identifier. */
+function toMatcher(identifier: string, caseInsensitive: boolean): RegExp {
   // \b works on word characters, so this also catches identifiers embedded
   // in import specifiers like "@/lib/affiliate" (the '/' and quote around
   // it are non-word characters, so the boundary still lands correctly).
@@ -394,7 +476,10 @@ function toMatcher(identifier: string | RegExp, caseInsensitive: boolean): RegEx
  * `/* not a comment *\/`-looking substring inside a string). A string that
  * itself spans multiple lines (an unterminated literal, or a multi-line
  * template literal) is not tracked past the line break — this remains a
- * best-effort, line-based strip, not a real parser.
+ * best-effort, line-based strip, not a real parser. A block comment is
+ * replaced by one space (never by nothing), so the tokens on either side of
+ * it stay separate. A regular-expression literal that contains `/*` or `//`
+ * is not recognized and is treated as a comment start.
  */
 function stripCommentLines(src: string): string {
   let inBlockComment = false;
@@ -433,6 +518,9 @@ function stripCommentLines(src: string): string {
 
         if (ch === "/" && next === "/") return out; // rest of the line is a line comment
         if (ch === "/" && next === "*") {
+          // Leave a space where the comment was, so `return/* x */commission`
+          // still reads as two tokens (and `pay/* x */out` does not become one).
+          out += " ";
           inBlockComment = true;
           i += 2;
           continue;
@@ -480,18 +568,91 @@ function loadNodeFs(): typeof import("node:fs") {
   return fs;
 }
 
-function normalizeToMap(files: SourceFiles): Record<string, string> {
-  if (Array.isArray(files)) {
-    // Only this branch (file-path list) touches the filesystem. The
-    // map-of-content form below never loads node:fs at all.
-    const { readFileSync } = loadNodeFs();
-    const map: Record<string, string> = {};
-    for (const path of files) {
-      map[path] = readFileSync(path, "utf8");
-    }
-    return map;
+/** Read `opts` once: undefined or a plain object whose flags are booleans or undefined. */
+function readScanOptions(opts: unknown): Required<AssertNoPayoutImportsOptions> {
+  if (opts === undefined) return { ...DEFAULT_OPTIONS };
+  if (!isPlainRecord(opts)) throw new TypeError("assertNoPayoutImports: opts must be a plain object (or omitted).");
+  const resolved = { ...DEFAULT_OPTIONS };
+  for (const key of ["stripComments", "caseInsensitive"] as const) {
+    const value = opts[key];
+    if (value === undefined) continue;
+    if (typeof value !== "boolean") throw new TypeError(`assertNoPayoutImports: opts.${key} must be a boolean (or omitted).`);
+    resolved[key] = value;
   }
-  return files;
+  return resolved;
+}
+
+/** Validate every identifier with one indexed pass and build its matcher. */
+function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { label: string; regex: RegExp }[] {
+  if (!Array.isArray(payoutIdentifiers)) {
+    throw new TypeError("assertNoPayoutImports: payoutIdentifiers must be an array of strings and/or RegExps.");
+  }
+  const length = payoutIdentifiers.length;
+  if (length === 0) {
+    throw new TypeError(
+      "assertNoPayoutImports: payoutIdentifiers is empty, so nothing would be matched. Pass at least one identifier.",
+    );
+  }
+  const matchers: { label: string; regex: RegExp }[] = [];
+  for (let index = 0; index < length; index += 1) {
+    if (!hasOwn(payoutIdentifiers, index)) {
+      throw new TypeError(`assertNoPayoutImports: payoutIdentifiers[${index}] is missing (a hole in a sparse array).`);
+    }
+    const identifier: unknown = payoutIdentifiers[index];
+    if (typeof identifier === "string") {
+      if (isBlank(identifier)) {
+        throw new TypeError(
+          `assertNoPayoutImports: payoutIdentifiers[${index}] is blank (only whitespace or invisible characters).`,
+        );
+      }
+      matchers.push({ label: identifier, regex: toMatcher(identifier, caseInsensitive) });
+    } else if (typeof identifier === "object" && identifier !== null && kindOf(identifier) === "RegExp") {
+      // Read through the RegExp's internal slots, not its own `source`/`flags`.
+      const { source, flags } = regExpParts(identifier);
+      matchers.push({ label: source, regex: new RegExp(source, flags.includes("g") ? flags : flags + "g") });
+    } else {
+      throw new TypeError(`assertNoPayoutImports: payoutIdentifiers[${index}] must be a string or a RegExp.`);
+    }
+  }
+  return matchers;
+}
+
+/**
+ * Validate `files` and return `[path, content]` pairs, read once. Only the
+ * path-list form touches the filesystem, and only after validation.
+ */
+function readSourceFiles(files: unknown): [string, string][] {
+  const empty = "assertNoPayoutImports: files is empty, so nothing would be scanned. Pass at least one file.";
+  if (Array.isArray(files)) {
+    const length = files.length;
+    if (length === 0) throw new TypeError(empty);
+    const paths: string[] = [];
+    for (let index = 0; index < length; index += 1) {
+      if (!hasOwn(files, index)) {
+        throw new TypeError(`assertNoPayoutImports: files[${index}] is missing (a hole in a sparse array).`);
+      }
+      const path: unknown = files[index];
+      if (typeof path !== "string" || isBlank(path)) {
+        throw new TypeError(`assertNoPayoutImports: files[${index}] must be a non-blank path string.`);
+      }
+      paths.push(path);
+    }
+    const { readFileSync } = loadNodeFs();
+    return paths.map((path) => [path, readFileSync(path, "utf8")]);
+  }
+  if (!isPlainRecord(files)) {
+    throw new TypeError(
+      "assertNoPayoutImports: files must be an array of paths or a plain { path: content } object.",
+    );
+  }
+  const entries = Object.entries(files);
+  if (entries.length === 0) throw new TypeError(empty);
+  for (const [path, content] of entries) {
+    if (typeof content !== "string") {
+      throw new TypeError(`assertNoPayoutImports: files[${quote(path)}] must be a string of file content.`);
+    }
+  }
+  return entries as [string, string][];
 }
 
 /**
@@ -522,22 +683,28 @@ function normalizeToMap(files: SourceFiles): Record<string, string> {
  * larger identifier with no delimiter (see `toMatcher`). See README.md,
  * "Honest limits", for the full list — an empty result is a signal, not a
  * guarantee.
+ *
+ * Throws a TypeError, before reading any file, when the scan could not
+ * mean anything: `files` is empty, is neither an array of non-blank path
+ * strings nor a plain `{ path: content }` object, has a hole, or has a
+ * non-string content; `payoutIdentifiers` is empty, has a hole, or has an
+ * entry that is a blank string (only whitespace or invisible characters)
+ * or neither a string nor a real `RegExp`; or `opts` is not a plain object
+ * with boolean flags. A missing file in path-list mode throws the error
+ * from Node's `fs`.
  */
 export function assertNoPayoutImports(
   files: SourceFiles,
   payoutIdentifiers: (string | RegExp)[],
   opts: AssertNoPayoutImportsOptions = {},
 ): PayoutImportOffense[] {
-  const { stripComments, caseInsensitive } = { ...DEFAULT_OPTIONS, ...opts };
-  const fileMap = normalizeToMap(files);
-  const matchers = payoutIdentifiers.map((id) => ({
-    label: id instanceof RegExp ? id.source : id,
-    regex: toMatcher(id, caseInsensitive),
-  }));
+  const { stripComments, caseInsensitive } = readScanOptions(opts);
+  const matchers = readMatchers(payoutIdentifiers, caseInsensitive);
+  const sources = readSourceFiles(files);
 
   const offenses: PayoutImportOffense[] = [];
 
-  for (const [path, rawContent] of Object.entries(fileMap)) {
+  for (const [path, rawContent] of sources) {
     const content = stripComments ? stripCommentLines(rawContent) : rawContent;
     const lines = content.split("\n");
     const matches: PayoutImportOffense["matches"] = [];
