@@ -435,3 +435,31 @@ describe("deepEqual mismatch branches (tests audit)", () => {
     expect(deepEqual(plain, date)).toBe(false);
   });
 });
+
+describe("arguments objects", () => {
+  const args = (...values: unknown[]): object =>
+    Reflect.apply(
+      function () {
+        // eslint-disable-next-line prefer-rest-params -- an arguments object is the value under test
+        return arguments;
+      },
+      undefined,
+      values,
+    ) as object;
+
+  it("does not equate an arguments object with a plain object that has the same entries", () => {
+    expect(deepEqual(args(1, 2), { 0: 1, 1: 2 })).toBe(false);
+    expect(deepEqual({ 0: 1, 1: 2 }, args(1, 2))).toBe(false);
+    expect(deepEqual(args(1, 2), args(1, 2))).toBe(true);
+    expect(deepEqual(args(1, 2), args(1, 3))).toBe(false);
+  });
+
+  it("copies an arguments object so an untouched one equals its snapshot and an edit is detected", () => {
+    const value = args({ n: 1 }) as { 0: { n: number } };
+    const copy = snapshot(value);
+    expect(copy).not.toBe(value);
+    expect(deepEqual(copy, value)).toBe(true);
+    value[0].n = 2;
+    expect(deepEqual(copy, value)).toBe(false);
+  });
+});

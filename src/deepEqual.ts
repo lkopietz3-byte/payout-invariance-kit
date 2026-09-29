@@ -22,6 +22,7 @@ type PairMemo = WeakMap<object, WeakSet<object>>;
  */
 export type Kind =
   | "Object"
+  | "Arguments"
   | "Array"
   | "Date"
   | "RegExp"
@@ -178,7 +179,9 @@ const brandCache = new WeakMap<object, Brand>();
 
 /** Internal. Record the brand of a value this package just created. */
 export function registerBrand(value: object, kind: Kind): void {
-  if (kind === "Object" || kind === "Array" || kind === "TypedArray") brandCache.set(value, "None");
+  if (kind === "Object" || kind === "Arguments" || kind === "Array" || kind === "TypedArray") {
+    brandCache.set(value, "None");
+  }
   else if (kind !== "Error" && kind !== "DataView") brandCache.set(value, kind);
 }
 
@@ -269,9 +272,17 @@ function classify(value: object): Kind {
   if (brand !== "None") return brand;
   const byChain = classifyByChain(value);
   if (byChain !== undefined) return byChain;
-  // An Error from another realm has none of this realm's prototypes; with no
-  // tag anywhere on its chain, Object.prototype.toString reports its slot.
-  return objectToString(value) === "[object Error]" ? "Error" : "Object";
+  // With no tag anywhere on the chain, Object.prototype.toString reports the
+  // engine's own tag: an `arguments` object, or an Error from another realm
+  // (which has none of this realm's prototypes).
+  switch (objectToString(value)) {
+    case "[object Arguments]":
+      return "Arguments";
+    case "[object Error]":
+      return "Error";
+    default:
+      return "Object";
+  }
 }
 
 /**
@@ -407,9 +418,9 @@ function isIdentityKey(value: unknown): boolean {
  * - Primitives with `Object.is`: `NaN` equals `NaN`, `0` and `-0` are
  *   different, and there is no floating-point tolerance (`0.1 + 0.2` is not
  *   `0.3`). Pass your own `isEqual` for tolerance.
- * - Plain objects, class instances, arrays, `Map`, `Set`, `Date`, `RegExp`,
- *   `Error`, boxed primitives, `ArrayBuffer`, `SharedArrayBuffer`,
- *   `DataView`, and typed arrays, by content. Both sides must have the same
+ * - Plain objects, class instances, `arguments` objects, arrays, `Map`,
+ *   `Set`, `Date`, `RegExp`, `Error`, boxed primitives, `ArrayBuffer`,
+ *   `SharedArrayBuffer`, `DataView`, and typed arrays, by content. Both sides must have the same
  *   prototype, so a class instance never equals a plain object with the
  *   same fields. On every one of these, own enumerable string and symbol
  *   keys are compared too (for example a `score` property attached to an
@@ -438,8 +449,7 @@ function isIdentityKey(value: unknown): boolean {
  * custom `isEqual`.
  *
  * Known gaps: a `Promise` whose prototype was replaced is compared as an
- * ordinary object (there is no side-effect-free way to recognize one), and
- * an `arguments` object is compared like a plain object.
+ * ordinary object (there is no side-effect-free way to recognize one).
  *
  * An own `__proto__` key (from `JSON.parse`) is compared like any other key.
  * Never mutates its arguments. It reads (and so runs the getters of) only
@@ -477,6 +487,7 @@ function equal(a: unknown, b: unknown, memo: PairMemo): boolean {
 function equalContents(a: object, b: object, kind: Exclude<Kind, "Opaque">, memo: PairMemo): boolean {
   switch (kind) {
     case "Object":
+    case "Arguments":
       return true;
     case "Array":
       return (a as unknown[]).length === (b as unknown[]).length;

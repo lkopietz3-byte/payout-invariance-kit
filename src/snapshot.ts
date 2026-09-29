@@ -5,13 +5,13 @@
  * it compares the copy to the live value with `deepEqual`. This file is
  * shared, byte for byte, by payout-invariance-kit and mutation-invariance-kit.
  *
- * It copies plain and class objects (prototype preserved), arrays (holes
- * preserved), `Map`, `Set`, `Date`, `RegExp`, `ArrayBuffer`, and typed
- * arrays, including circular references, and on each of them the own
- * enumerable string and symbol properties `deepEqual` compares (so an
- * untouched typed array with a `label` property equals its copy). Built-in
- * content is read with the same intrinsics `deepEqual` uses, never through
- * the value's own methods or getters.
+ * It copies plain and class objects (prototype preserved), `arguments`
+ * objects, arrays (holes preserved), `Map`, `Set`, `Date`, `RegExp`,
+ * `ArrayBuffer`, and typed arrays, including circular references, and on
+ * each of them the own enumerable string and symbol properties `deepEqual`
+ * compares (so an untouched typed array with a `label` property equals its
+ * copy). Built-in content is read with the same intrinsics `deepEqual`
+ * uses, never through the value's own methods or getters.
  *
  * Everything else is kept by reference, so in-place changes inside it are
  * not detected: functions, `Error`, boxed primitives, `DataView`,
@@ -61,6 +61,12 @@ for (const name of [
   if (typeof candidate === "function") typedArrayConstructors.set(name, candidate as TypedArrayConstructor);
 }
 
+/** A fresh, empty `arguments` object (this module is strict, so it is unmapped). */
+function emptyArguments(): object {
+  // eslint-disable-next-line prefer-rest-params -- the only way to create an arguments object
+  return (function () { return arguments; })();
+}
+
 export function snapshot<T>(value: T): T {
   return clone(value, new WeakMap()) as T;
 }
@@ -87,6 +93,9 @@ function clone(value: unknown, seen: WeakMap<object, unknown>): unknown {
   switch (kind) {
     case "Object":
       copy = Object.create(Object.getPrototypeOf(value) as object | null) as object;
+      break;
+    case "Arguments":
+      copy = emptyArguments();
       break;
     case "Array":
       copy = new Array<unknown>((value as unknown[]).length);
