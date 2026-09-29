@@ -1,6 +1,6 @@
 {
   "name": "payout-invariance-kit",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Check whether a ranking/recommendation/comparison engine's output changes based on which option pays the operator more — a runtime mutation check plus a static import check, both framework-agnostic.",
   "keywords": [
     "affiliate-neutrality",

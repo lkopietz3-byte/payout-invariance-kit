@@ -43,18 +43,30 @@ wire them into vitest, jest, `node:test`, or a plain script.
 npm install --save-dev payout-invariance-kit vitest
 ```
 
-Or build from source: clone the repository and run `npm install && npm run build`.
+Or build from source: clone the repository and run `npm ci && npm run build`.
+Zero runtime dependencies (`dependencies: {}` in package.json). MIT licensed.
 
-Requires Node 20 or later. ESM package — `import` works everywhere, and
-CommonJS `require("payout-invariance-kit")` works on Node versions that
-support `require(esm)` (Node >=20.19.0 or >=22.12.0; older Node 20/22 patch
-releases must use dynamic `import()` instead). Zero runtime dependencies —
-`dependencies: {}` in package.json. `assertNoPayoutImports`'s file-path mode
-loads Node's built-in `fs` lazily (via `process.getBuiltinModule`, Node
->=20.16.0/>=22.3.0) and is never imported at the top level, so the module
-itself loads fine in a browser or Workers bundle; give it a pre-loaded
-content map instead of file paths if you need that mode to actually run
-outside Node.
+It is an ESM package (`"type": "module"`). `import` is the supported way to
+load it. `require()` also works where Node can `require(esm)`:
+
+| How you load it | Node 20.19+ | Node 22.12+ | Node 24 and 26 | Older Node 20 or 22 |
+| --- | --- | --- | --- | --- |
+| `import { assertPayoutInvariance } from "payout-invariance-kit"` | works | works | works | works |
+| `require("payout-invariance-kit")` | works | works | works | fails (no `require(esm)`); use `import()` |
+
+ESM package; `require()` works on Node >=20.19 / >=22.12. Recommended runtimes
+are Node 22 and 24 (LTS) and Node 26 (current). Node 20 is end-of-life. CI
+still runs the tests and the installed-package checks on Node 20.19.0 and
+22.12.0 (the `require(esm)` floors) to catch regressions, but that is
+compatibility testing, not a recommendation. `engines` in `package.json` is
+`>=20`. TypeScript resolves the package under `node10`, `node16`/`nodenext`
+and `bundler` resolution (checked by `attw` in CI).
+
+`assertNoPayoutImports`'s file-path mode loads Node's built-in `fs` lazily
+(via `process.getBuiltinModule`, Node >=20.16.0/>=22.3.0) and is never
+imported at the top level, so the module itself loads fine in a browser or
+Workers bundle; give it a pre-loaded content map instead of file paths if you
+need that mode to run outside Node.
 
 ## Quickstart
 
@@ -127,10 +139,14 @@ plain boolean.
 **It throws, instead of returning a misleading result, when the run cannot
 be trusted:**
 
-- `rankFn` is not a function, or `mutations` is not a non-empty array of
-  `{ name, mutate }` objects — checked before anything runs.
+- `rankFn` is not a function, `mutations` is not a non-empty, dense array of
+  `{ name, mutate }` objects (a hole in a sparse array is rejected), or
+  `opts` is not a plain object whose `isEqual`/`hasChanged` are functions —
+  all checked before anything runs. Each scenario's `name` and `mutate` are
+  read once, and the run uses exactly the scenarios that were checked.
 - `rankFn` or `mutate` throws. The error names the scenario and keeps the
-  original error as `cause`.
+  original error as `cause`. Scenario names and thrown messages are escaped
+  in the error text (newlines, control and bidi characters).
 - `rankFn` or `mutate` returns a Promise (or any thenable) — see
   [Async ranking functions](#async-ranking-functions).
 - `rankFn` or `mutate` modifies `baseInput` in place, or a later `rankFn`
@@ -158,31 +174,106 @@ whatever your framework provides; the result object doesn't change.)
 
 ### Async ranking functions
 
-`assertPayoutInvariance` is synchronous. For a real async ranker, resolve
-every call yourself first, then hand it a synchronous lookup over the
-already-resolved results:
+`assertPayoutInvariance` is synchronous, and there is no general async
+version. The recipe below covers one narrow shape: an async ranker that
+resolves to an array of candidate ids, on plain-data input. It keeps the
+library's guards where they matter:
+
+- `assertPayoutInvariance` itself validates the scenarios, runs each
+  `mutate` once, rejects an in-place edit or a Promise from `mutate`, and
+  flags vacuous scenarios, all before the ranker is awaited even once.
+- Each result is copied as soon as it resolves, so a ranker that reuses one
+  output array and rewrites it cannot make two results look the same.
+- A copy of `baseInput` taken before the first call catches a ranker that
+  edits it in place.
+
+What it does not do: it does not support other result shapes (write a
+projection to an array of strings, or adapt the copy step to your type), it
+does not accept inputs `structuredClone` cannot copy faithfully (class
+instances, functions, Maps with object keys you compare by identity), it
+awaits calls one at a time, and a rejected call propagates as-is without
+naming the scenario. It cannot see side effects outside `baseInput` (a
+cache, a database row).
 
 ```ts
-async function assertAsyncPayoutInvariance<TInput, TResult>(
-  rankFn: (input: TInput) => Promise<TResult>,
+import { assertPayoutInvariance, deepEqual } from "payout-invariance-kit";
+import type { PayoutInvarianceResult, PayoutMutationScenario } from "payout-invariance-kit";
+
+/**
+ * Check an async ranker that resolves to an array of candidate ids.
+ *
+ * Limits: `baseInput` must be structured-clonable plain data (objects,
+ * arrays, strings, numbers, booleans, null); the ranker must resolve to an
+ * array of strings; calls are awaited one at a time; a rejected call
+ * propagates as-is.
+ */
+async function assertAsyncRankingInvariance<TInput>(
+  rankIds: (input: TInput) => Promise<readonly string[]>,
   baseInput: TInput,
   mutations: PayoutMutationScenario<TInput>[],
-) {
-  const mutatedInputs = mutations.map((m) => m.mutate(baseInput));
-  const allInputs = [baseInput, ...mutatedInputs];
-  const results = await Promise.all(allInputs.map((input) => rankFn(input)));
-  const resultByIndex = new Map(allInputs.map((input, i) => [input, results[i] as TResult]));
+): Promise<PayoutInvarianceResult<TInput, string[]>> {
+  // A copy taken before any call, to catch a ranker that edits baseInput.
+  const pristine = structuredClone(baseInput);
 
-  return assertPayoutInvariance(
-    (input: TInput) => resultByIndex.get(input) as TResult,
-    baseInput,
-    mutations.map((m, i) => ({ ...m, mutate: () => mutatedInputs[i] as TInput })),
-  );
+  // Synchronous pass: assertPayoutInvariance validates the scenarios, runs
+  // each mutate once, rejects in-place edits and Promises from mutate, and
+  // flags vacuous scenarios. Each call returns a distinct number, so every
+  // non-vacuous scenario comes back as a "failure" carrying its input.
+  let calls = 0;
+  const plan = assertPayoutInvariance(() => calls++, baseInput, mutations);
+
+  // Async pass: await one call at a time and copy each result right away,
+  // so a ranker that reuses or later edits its output array cannot change
+  // what was recorded.
+  const idsFor = async (input: TInput): Promise<string[]> => {
+    const result: unknown = await rankIds(input);
+    if (!Array.isArray(result)) throw new TypeError("rankIds must resolve to an array of strings.");
+    const ids: string[] = [];
+    for (let i = 0; i < result.length; i += 1) {
+      const id: unknown = result[i];
+      if (typeof id !== "string") throw new TypeError(`rankIds result[${i}] must be a string.`);
+      ids.push(id);
+    }
+    return ids;
+  };
+
+  const baseline = await idsFor(baseInput);
+  const failures: PayoutInvarianceResult<TInput, string[]>["failures"] = [];
+  for (const { scenario, mutatedInput } of plan.failures) {
+    const actual = await idsFor(mutatedInput);
+    if (!deepEqual(actual, baseline)) failures.push({ scenario, mutatedInput, expected: baseline, actual });
+  }
+  if (!deepEqual(pristine, baseInput)) throw new Error("rankIds modified baseInput in place.");
+
+  return { passed: failures.length === 0 && plan.vacuous.length === 0, baseline, failures, vacuous: plan.vacuous };
 }
 ```
 
-`examples/async-ranking.test.ts` runs this against an honest and a
-payout-sensitive async ranker.
+`examples/async-ranking.test.ts` runs this exact code (a test checks that the
+README copy matches) against an honest ranker, a payout-sensitive one, one
+that reuses its output array, and ones that edit `baseInput`.
+
+### `deepEqual(a, b)`
+
+The default comparator, exported so you can reuse it (for example inside
+your own `isEqual`, after projecting away a timestamp). Strict structural
+equality: `Object.is` for primitives (`NaN` equals `NaN`, `0` and `-0`
+differ), same prototype required, own enumerable string and symbol keys
+compared on objects, arrays, `Map`, `Set`, `Date`, `RegExp`, `Error`, boxed
+primitives, `arguments` objects, buffers, `DataView`s and typed arrays
+(including extra properties such as a `score` attached to an
+`ArrayBuffer`). Built-ins are recognized by brand checks and read through
+the built-in operations. Array holes differ from `undefined`, circular
+references are handled, and values it cannot inspect are equal only to
+themselves (see [Honest limits](#honest-limits)). It never mutates its
+arguments; an error thrown by a getter or `Proxy` trap it reads propagates.
+
+```ts
+import { deepEqual } from "payout-invariance-kit";
+
+deepEqual({ ids: ["a", "b"] }, { ids: ["a", "b"] }); // true
+deepEqual(0, -0); // false
+```
 
 ### `assertNoPayoutImports(files, payoutIdentifiers, opts?)`
 
@@ -219,7 +310,16 @@ stripped before matching by default (`opts.stripComments`, default `true`),
 so a comment that merely *mentions* a forbidden word doesn't count as a
 reference — a same-line string or template literal (e.g. a URL like
 `"https://api.example.com/payout"`) is tracked too, so a `//` inside one
-isn't mistaken for the start of a line comment.
+isn't mistaken for the start of a line comment. A removed block comment
+leaves a space behind, so `return/* note */commission` is still found.
+
+It throws a `TypeError`, before reading any file, instead of returning a
+clean-looking `[]` for a scan that could not mean anything: an empty `files`
+list or map, an empty `payoutIdentifiers` list, a blank identifier (only
+whitespace or invisible characters), an entry that is neither a string nor a
+real `RegExp`, a hole in either list, a `files` value that is neither an
+array of paths nor a plain `{ path: content }` object, non-string content, or
+non-boolean options.
 
 ## Honest limits — read this before trusting a green check
 
@@ -245,14 +345,24 @@ strong as the scenarios you write, so:
   not a one-time certificate — put it in CI.
 - `deepEqual` (the default comparator) is strict: `0` and `-0` differ, there
   is no floating-point tolerance, and a class instance never equals a plain
-  object with the same fields. Values it cannot inspect (`Promise`,
-  `WeakMap`, an object with a custom `Symbol.toStringTag`) are equal only to
+  object with the same fields. Built-ins are recognized by brand checks and
+  read through the built-in operations, so a masked `Symbol.toStringTag` or
+  an overridden `getTime`/`valueOf`/`size` cannot hide a difference. Values
+  it cannot inspect (`Promise`, `WeakMap`, `WeakRef`, an object with a custom
+  `Symbol.toStringTag`, a `Proxy` around a `Map`) are equal only to
   themselves — pass a custom `isEqual` if your result contains one of these
-  and you want to compare it structurally.
+  and you want to compare it structurally. One known gap: a `Promise` whose
+  prototype was replaced is compared as an ordinary object, because there is
+  no side-effect-free way to recognize one.
+- `deepEqual` checks each object's brand once and caches it. The first check
+  of an object costs several failed brand checks (about 15 to 25
+  microseconds per object on Node 26 on an Apple-silicon laptop, measured on
+  40,000 fresh objects); later comparisons of the same objects are fast.
 - Detecting an in-place edit to `baseInput` or the baseline result has blind
   spots: values kept by reference in the internal snapshot (functions,
-  `Error`, `Promise`, private `#fields`) are not deep-copied, so a mutation
-  hidden inside one of those is not caught.
+  `Error`, boxed primitives, `DataView`, `SharedArrayBuffer`, `Promise`,
+  private `#fields`) are not deep-copied, so a mutation hidden inside one of
+  those is not caught.
 
 **`assertNoPayoutImports` is a best-effort text/regex grep, not a real
 parser.** It doesn't do AST analysis or follow the import graph, so it
@@ -276,6 +386,11 @@ cannot see:
 - A string or template literal that itself spans multiple lines — same-line
   string tracking (used so a `//` inside a URL isn't mistaken for a
   comment) is not carried across a line break.
+- A regular-expression literal that contains `/*` or `//`, such as
+  `/[/*]/`. The comment stripper cannot tell it from a comment, so it can
+  hide the code after it until the next `*/`. Pass
+  `{ stripComments: false }` for files like that (comments are then scanned
+  too, so a comment that mentions a forbidden word counts).
 
 Both checks are strong signals, not a mathematical guarantee — use them
 together, and combine them with an actual code-review policy for anything
@@ -290,7 +405,10 @@ just payout. This kit applies that specifically to payout/commission/affiliate
 inputs and adds the static check, `assertNoPayoutImports`, which the general
 kit does not have. The scenario shape (`name` plus `mutate`) matches between
 the two. Use this kit for the payout axis specifically; use the general kit
-for any other "should not depend on X" claim. The two packages share no code.
+for any other "should not depend on X" claim. Neither package depends on the
+other; each ships its own copy of the same comparator and snapshot source
+(`src/deepEqual.ts` and `src/snapshot.ts` are kept byte-identical), so
+`deepEqual` behaves the same in both.
 
 ## License
 
