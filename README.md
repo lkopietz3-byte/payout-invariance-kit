@@ -158,31 +158,84 @@ whatever your framework provides; the result object doesn't change.)
 
 ### Async ranking functions
 
-`assertPayoutInvariance` is synchronous. For a real async ranker, resolve
-every call yourself first, then hand it a synchronous lookup over the
-already-resolved results:
+`assertPayoutInvariance` is synchronous, and there is no general async
+version. The recipe below covers one narrow shape: an async ranker that
+resolves to an array of candidate ids, on plain-data input. It keeps the
+library's guards where they matter:
+
+- `assertPayoutInvariance` itself validates the scenarios, runs each
+  `mutate` once, rejects an in-place edit or a Promise from `mutate`, and
+  flags vacuous scenarios, all before the ranker is awaited even once.
+- Each result is copied as soon as it resolves, so a ranker that reuses one
+  output array and rewrites it cannot make two results look the same.
+- A copy of `baseInput` taken before the first call catches a ranker that
+  edits it in place.
+
+What it does not do: it does not support other result shapes (write a
+projection to an array of strings, or adapt the copy step to your type), it
+does not accept inputs `structuredClone` cannot copy faithfully (class
+instances, functions, Maps with object keys you compare by identity), it
+awaits calls one at a time, and a rejected call propagates as-is without
+naming the scenario. It cannot see side effects outside `baseInput` (a
+cache, a database row).
 
 ```ts
-async function assertAsyncPayoutInvariance<TInput, TResult>(
-  rankFn: (input: TInput) => Promise<TResult>,
+import { assertPayoutInvariance, deepEqual } from "payout-invariance-kit";
+import type { PayoutInvarianceResult, PayoutMutationScenario } from "payout-invariance-kit";
+
+/**
+ * Check an async ranker that resolves to an array of candidate ids.
+ *
+ * Limits: `baseInput` must be structured-clonable plain data (objects,
+ * arrays, strings, numbers, booleans, null); the ranker must resolve to an
+ * array of strings; calls are awaited one at a time; a rejected call
+ * propagates as-is.
+ */
+async function assertAsyncRankingInvariance<TInput>(
+  rankIds: (input: TInput) => Promise<readonly string[]>,
   baseInput: TInput,
   mutations: PayoutMutationScenario<TInput>[],
-) {
-  const mutatedInputs = mutations.map((m) => m.mutate(baseInput));
-  const allInputs = [baseInput, ...mutatedInputs];
-  const results = await Promise.all(allInputs.map((input) => rankFn(input)));
-  const resultByIndex = new Map(allInputs.map((input, i) => [input, results[i] as TResult]));
+): Promise<PayoutInvarianceResult<TInput, string[]>> {
+  // A copy taken before any call, to catch a ranker that edits baseInput.
+  const pristine = structuredClone(baseInput);
 
-  return assertPayoutInvariance(
-    (input: TInput) => resultByIndex.get(input) as TResult,
-    baseInput,
-    mutations.map((m, i) => ({ ...m, mutate: () => mutatedInputs[i] as TInput })),
-  );
+  // Synchronous pass: assertPayoutInvariance validates the scenarios, runs
+  // each mutate once, rejects in-place edits and Promises from mutate, and
+  // flags vacuous scenarios. Each call returns a distinct number, so every
+  // non-vacuous scenario comes back as a "failure" carrying its input.
+  let calls = 0;
+  const plan = assertPayoutInvariance(() => calls++, baseInput, mutations);
+
+  // Async pass: await one call at a time and copy each result right away,
+  // so a ranker that reuses or later edits its output array cannot change
+  // what was recorded.
+  const idsFor = async (input: TInput): Promise<string[]> => {
+    const result: unknown = await rankIds(input);
+    if (!Array.isArray(result)) throw new TypeError("rankIds must resolve to an array of strings.");
+    const ids: string[] = [];
+    for (let i = 0; i < result.length; i += 1) {
+      const id: unknown = result[i];
+      if (typeof id !== "string") throw new TypeError(`rankIds result[${i}] must be a string.`);
+      ids.push(id);
+    }
+    return ids;
+  };
+
+  const baseline = await idsFor(baseInput);
+  const failures: PayoutInvarianceResult<TInput, string[]>["failures"] = [];
+  for (const { scenario, mutatedInput } of plan.failures) {
+    const actual = await idsFor(mutatedInput);
+    if (!deepEqual(actual, baseline)) failures.push({ scenario, mutatedInput, expected: baseline, actual });
+  }
+  if (!deepEqual(pristine, baseInput)) throw new Error("rankIds modified baseInput in place.");
+
+  return { passed: failures.length === 0 && plan.vacuous.length === 0, baseline, failures, vacuous: plan.vacuous };
 }
 ```
 
-`examples/async-ranking.test.ts` runs this against an honest and a
-payout-sensitive async ranker.
+`examples/async-ranking.test.ts` runs this exact code (a test checks that the
+README copy matches) against an honest ranker, a payout-sensitive one, one
+that reuses its output array, and ones that edit `baseInput`.
 
 ### `assertNoPayoutImports(files, payoutIdentifiers, opts?)`
 
