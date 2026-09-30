@@ -323,9 +323,9 @@ export function assertPayoutInvariance<TInput, TResult>(
     if (isThenable(output)) {
       throw new TypeError(
         `assertPayoutInvariance: rankFn returned a Promise (or thenable) ${where}. assertPayoutInvariance ` +
-          `is synchronous and would compare two Promise objects (which are always "equal" once their own ` +
-          `properties are compared), not the values they resolve to. Await rankFn yourself and pass the ` +
-          `resolved value in. See README.md, "Async ranking functions".`,
+          `is synchronous and would compare two Promise objects, not the values they resolve to (and each ` +
+          `Promise is equal only to itself, since its state cannot be read). Await rankFn yourself and pass ` +
+          `the resolved value in. See README.md, "Async ranking functions".`,
       );
     }
     return output as TResult;
