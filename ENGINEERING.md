@@ -61,8 +61,12 @@ has a regression test that failed against the pre-fix commit.
 - In-place change detection does not see inside values kept by reference
   (functions, `Error`, boxed primitives, `DataView`, `SharedArrayBuffer`,
   `Promise`, private fields).
-- A `Promise` whose prototype was replaced is compared as an ordinary
-  object; there is no side-effect-free brand check for promises.
+- A `Promise` whose prototype was replaced, and a `Proxy` whose traps hide
+  both its prototype and its `constructor`, are compared as ordinary
+  objects; there is no side-effect-free way to recognize them.
+- Known false passes of the default comparison (README, "Honest limits"):
+  state kept only in private `#fields`, and one shared `Error`, `DataView`
+  or boxed primitive returned and edited on every call.
 - `assertNoPayoutImports`'s comment stripper is a lexer, not a parser: a
   regex literal right after `)` or `]` is read as division, and a lone
   backtick in JSX text opens a template that never closes, so either can
