@@ -349,11 +349,21 @@ strong as the scenarios you write, so:
   read through the built-in operations, so a masked `Symbol.toStringTag` or
   an overridden `getTime`/`valueOf`/`size` cannot hide a difference. Values
   it cannot inspect (`Promise`, `WeakMap`, `WeakRef`, an object with a custom
-  `Symbol.toStringTag`, a `Proxy` around a `Map`) are equal only to
-  themselves — pass a custom `isEqual` if your result contains one of these
-  and you want to compare it structurally. One known gap: a `Promise` whose
-  prototype was replaced is compared as an ordinary object, because there is
-  no side-effect-free way to recognize one.
+  `Symbol.toStringTag`, a `Proxy` around a `Map` or a `Date` from any realm,
+  anything else that looks like a built-in but fails its brand check) are
+  equal only to themselves — pass a custom `isEqual` if your result contains
+  one of these and you want to compare it structurally. Known gaps: a
+  `Promise` whose prototype was replaced, and a `Proxy` whose traps hide both
+  its prototype and its `constructor`, are compared as ordinary objects,
+  because there is no side-effect-free way to recognize them.
+- **Private `#fields` are invisible to the default comparison.** JavaScript
+  does not let code outside a class read its private fields, so two
+  instances whose state lives only in `#fields` (exposed through getters)
+  compare equal whenever their public properties match. A biased ranker that
+  returns `new Ranked(topId)`, with `topId` stored in `#top`, passes. Fix it
+  on your side: pass an `isEqual` that compares the getters you care about
+  (`{ isEqual: (a, b) => a.top === b.top }`), or return plain data
+  (`{ top: topId }`) instead of a class with private state.
 - `deepEqual` checks each object's brand once and caches it. The first check
   of an object costs several failed brand checks (about 15 to 25
   microseconds per object on Node 26 on an Apple-silicon laptop, measured on
@@ -362,7 +372,11 @@ strong as the scenarios you write, so:
   spots: values kept by reference in the internal snapshot (functions,
   `Error`, boxed primitives, `DataView`, `SharedArrayBuffer`, `Promise`,
   private `#fields`) are not deep-copied, so a mutation hidden inside one of
-  those is not caught.
+  those is not caught. The same gap can produce a false pass: a ranker that
+  returns one shared `Error`, `DataView` or boxed primitive (with an extra
+  property) on every call, editing it each time, passes: the baseline and
+  every later result hold the same object, so they compare equal. Return a
+  fresh object per call, or plain data.
 
 **`assertNoPayoutImports` is a best-effort text/regex grep, not a real
 parser.** It doesn't do AST analysis or follow the import graph, so it
