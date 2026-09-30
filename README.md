@@ -366,7 +366,9 @@ strong as the scenarios you write, so:
   returns `new Ranked(topId)`, with `topId` stored in `#top`, passes. Fix it
   on your side: pass an `isEqual` that compares the getters you care about
   (`{ isEqual: (a, b) => a.top === b.top }`), or return plain data
-  (`{ top: topId }`) instead of a class with private state.
+  (`{ top: topId }`) instead of a class with private state. The same goes
+  for state kept only in non-enumerable properties, which are not compared
+  either.
 - `deepEqual` checks each object's brand once and caches it. The first check
   of an object costs several failed brand checks (about 15 to 25
   microseconds per object on Node 26 on an Apple-silicon laptop, measured on
