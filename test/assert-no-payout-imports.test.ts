@@ -79,7 +79,7 @@ describe("assertNoPayoutImports: what it catches", () => {
 
 describe("assertNoPayoutImports: comment-stripping does not eat string contents (regression)", () => {
   it("does not treat '//' inside a URL string literal as the start of a line comment", () => {
-    // Before the fix, stripCommentLines cut the line at the first "//" it
+    // Before the fix, the comment stripper cut the line at the first "//" it
     // found anywhere in the raw text, including inside a string. A URL like
     // "https://api.example.com/payout" would have everything from the "//"
     // onward silently discarded before matching ever ran — the reference to
@@ -164,17 +164,63 @@ describe("assertNoPayoutImports: honestly documented blind spots", () => {
     expect(assertNoPayoutImports({ "a.ts": src }, ["payout", "commission", "affiliateRate"])).toEqual([]);
   });
 
-  it("an unterminated multi-line template literal is not tracked past the line break", () => {
-    // Documented limit: string tracking in stripCommentLines resets at every
-    // line boundary, so a genuinely multi-line template literal is only
-    // string-aware on its first line.
-    const src = ["const s = `line one", "// this reads as a real comment on line two, not template content", "line three`;"].join(
-      "\n",
-    );
-    // The word "commission" placed where the (incorrectly detected) comment
-    // strips it out demonstrates the gap; this is expected, current behavior.
-    const withMention = src.replace("this reads", "commission reads");
-    expect(assertNoPayoutImports({ "a.ts": withMention }, ["commission"])).toEqual([]);
+  it("a '//' on a later line of a multi-line template literal is template text, not a comment", () => {
+    const src = ["const s = `line one", "// commission reads as template text on line two", "line three`;"].join("\n");
+    expect(assertNoPayoutImports({ "a.ts": src }, ["commission"])).toEqual([
+      { file: "a.ts", matches: [{ identifier: "commission", line: 2, text: "// commission reads as template text on line two" }] },
+    ]);
+  });
+});
+
+describe("assertNoPayoutImports: template literals never hide the code after them", () => {
+  const lineOf = (src: string): number[] =>
+    assertNoPayoutImports({ "f.ts": src }, ["payout"]).flatMap((offense) => offense.matches.map((match) => match.line));
+
+  it("a multi-line template containing an unclosed '/*' (a shell glob)", () => {
+    expect(lineOf("const sh = `\nrm -rf dist/*\n`;\nexport const score = (o) => o.payout;")).toEqual([4]);
+  });
+
+  it("a backtick inside a string inside a template expression, then '/*' in a string", () => {
+    expect(lineOf('const s = `${"`"}` + "/*";\nexport const score = (o) => o.payout * 2;')).toEqual([2]);
+  });
+
+  it("nested templates and braces inside ${ } expressions", () => {
+    expect(lineOf('const s = `a ${ `b ${ "}" } /*` } /* d`;\nreturn o.payout;')).toEqual([2]);
+    expect(lineOf("const s = `${ { a: 1 }.a } /*`;\nreturn o.payout;")).toEqual([2]);
+    expect(lineOf("const s = `${ f({ a: `/*` }) }\n/*`;\nreturn o.payout;")).toEqual([3]);
+  });
+
+  it("escaped backticks and dollar signs inside a template", () => {
+    expect(lineOf("const s = `\\` /* \\${ /*`;\nreturn o.payout;")).toEqual([2]);
+  });
+
+  it("a URL on its own line inside a multi-line template is kept", () => {
+    expect(lineOf("const u = `\nhttps://api.example.com/payout\n`;")).toEqual([2]);
+  });
+
+  it("the reviewer's single-line cases", () => {
+    expect(lineOf("const g = `a/*`;\nreturn o.payout;")).toEqual([2]);
+    expect(lineOf("const g = `${x}/*`;\nreturn o.payout;")).toEqual([2]);
+    expect(lineOf("fetch(`https://x.com/*`); return o.payout;")).toEqual([1]);
+  });
+
+  it("still strips real comments before, inside ${ } and after a template, keeping line numbers", () => {
+    expect(lineOf("const t = `\nx\n`; // payout\nconst y = 1;")).toEqual([]);
+    expect(lineOf("const t = `${ /* payout */ 1 }`;")).toEqual([]);
+    expect(lineOf("const t = `${ 1 // payout\n}`;")).toEqual([]);
+    expect(lineOf("const t = `a\nb`; /* payout\n */ return o.payout;")).toEqual([3]);
+  });
+
+  it("a regex literal containing a backtick or '/*' does not start a template or a comment", () => {
+    expect(lineOf("const re = /`/;\nconst sh = `rm -rf dist/*`;\nreturn o.payout;")).toEqual([3]);
+    expect(lineOf("const re = /[/*]/;\nreturn o.payout;")).toEqual([2]);
+    expect(lineOf("if (ok) return /\\/*x/.test(s);\nreturn o.payout;")).toEqual([2]);
+    expect(lineOf("const n = a / b; /* note */ return o.payout;")).toEqual([1]);
+  });
+
+  it("a quote inside a regex or JSX text only lasts to the end of its line", () => {
+    expect(lineOf("const re = /'/; return o.payout;")).toEqual([1]);
+    expect(lineOf("const t = <p>Don't /* </p>;\nreturn o.payout;")).toEqual([2]);
   });
 });
 

@@ -93,6 +93,18 @@ describe("assertPayoutInvariance: async ranking functions (regression)", () => {
     ).toThrow(/rankFn returned a Promise/);
   });
 
+  it("says Promises are not comparable (equal only to themselves), not that they are always equal", () => {
+    const asyncRank = async (input: typeof baseInput): Promise<RankResult> => honestRank(input);
+    let message = "";
+    try {
+      assertPayoutInvariance(asyncRank, baseInput, [bumpAllPayouts]);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("each Promise is equal only to itself");
+    expect(message).not.toMatch(/always/);
+  });
+
   it("throws when mutate returns a Promise", () => {
     expect(() =>
       assertPayoutInvariance(honestRank, baseInput, [

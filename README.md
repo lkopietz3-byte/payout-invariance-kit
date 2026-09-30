@@ -308,10 +308,13 @@ import-path segment, e.g. `"commission"` catches `import { commission } from
 `RegExp` for anything more specific. Line comments and block comments are
 stripped before matching by default (`opts.stripComments`, default `true`),
 so a comment that merely *mentions* a forbidden word doesn't count as a
-reference — a same-line string or template literal (e.g. a URL like
-`"https://api.example.com/payout"`) is tracked too, so a `//` inside one
-isn't mistaken for the start of a line comment. A removed block comment
-leaves a space behind, so `return/* note */commission` is still found.
+reference. The stripper is a small lexer: it skips strings, template
+literals (across lines, including nested `${ }` expressions) and regex
+literals, so a `//` or `/*` inside one (a URL like
+`"https://api.example.com/payout"`, a shell glob like `rm -rf dist/*` in a
+template) isn't mistaken for a comment. A removed block comment leaves a
+space behind, so `return/* note */commission` is still found, and line
+numbers never move.
 
 It throws a `TypeError`, before reading any file, instead of returning a
 clean-looking `[]` for a scan that could not mean anything: an empty `files`
@@ -349,11 +352,23 @@ strong as the scenarios you write, so:
   read through the built-in operations, so a masked `Symbol.toStringTag` or
   an overridden `getTime`/`valueOf`/`size` cannot hide a difference. Values
   it cannot inspect (`Promise`, `WeakMap`, `WeakRef`, an object with a custom
-  `Symbol.toStringTag`, a `Proxy` around a `Map`) are equal only to
-  themselves — pass a custom `isEqual` if your result contains one of these
-  and you want to compare it structurally. One known gap: a `Promise` whose
-  prototype was replaced is compared as an ordinary object, because there is
-  no side-effect-free way to recognize one.
+  `Symbol.toStringTag`, a `Proxy` around a `Map` or a `Date` from any realm,
+  anything else that looks like a built-in but fails its brand check) are
+  equal only to themselves — pass a custom `isEqual` if your result contains
+  one of these and you want to compare it structurally. Known gaps: a
+  `Promise` whose prototype was replaced, and a `Proxy` whose traps hide both
+  its prototype and its `constructor`, are compared as ordinary objects,
+  because there is no side-effect-free way to recognize them.
+- **Private `#fields` are invisible to the default comparison.** JavaScript
+  does not let code outside a class read its private fields, so two
+  instances whose state lives only in `#fields` (exposed through getters)
+  compare equal whenever their public properties match. A biased ranker that
+  returns `new Ranked(topId)`, with `topId` stored in `#top`, passes. Fix it
+  on your side: pass an `isEqual` that compares the getters you care about
+  (`{ isEqual: (a, b) => a.top === b.top }`), or return plain data
+  (`{ top: topId }`) instead of a class with private state. The same goes
+  for state kept only in non-enumerable properties, which are not compared
+  either.
 - `deepEqual` checks each object's brand once and caches it. The first check
   of an object costs several failed brand checks (about 15 to 25
   microseconds per object on Node 26 on an Apple-silicon laptop, measured on
@@ -362,7 +377,11 @@ strong as the scenarios you write, so:
   spots: values kept by reference in the internal snapshot (functions,
   `Error`, boxed primitives, `DataView`, `SharedArrayBuffer`, `Promise`,
   private `#fields`) are not deep-copied, so a mutation hidden inside one of
-  those is not caught.
+  those is not caught. The same gap can produce a false pass: a ranker that
+  returns one shared `Error`, `DataView` or boxed primitive (with an extra
+  property) on every call, editing it each time, passes: the baseline and
+  every later result hold the same object, so they compare equal. Return a
+  fresh object per call, or plain data.
 
 **`assertNoPayoutImports` is a best-effort text/regex grep, not a real
 parser.** It doesn't do AST analysis or follow the import graph, so it
@@ -383,12 +402,12 @@ cannot see:
   token. Pass a `RegExp` without a word boundary (e.g. `/payout/i`) if you
   need substring-level matching, or name your real payout fields so they
   appear as their own token somewhere reachable by the grep.
-- A string or template literal that itself spans multiple lines — same-line
-  string tracking (used so a `//` inside a URL isn't mistaken for a
-  comment) is not carried across a line break.
-- A regular-expression literal that contains `/*` or `//`, such as
-  `/[/*]/`. The comment stripper cannot tell it from a comment, so it can
-  hide the code after it until the next `*/`. Pass
+- Code after a spot where the comment stripper loses track. It is a
+  lexer, not a parser, and it guesses whether a `/` starts a regex literal
+  from the character before it: a regex right after `)` or `]` (such as
+  `if (ok) /[/*]/.test(s)`) is read as division, and a lone backtick in JSX
+  text opens a template literal that never closes. After either, a `/*`
+  can hide the code that follows until the next `*/`. Pass
   `{ stripComments: false }` for files like that (comments are then scanned
   too, so a comment that mentions a forbidden word counts).
 

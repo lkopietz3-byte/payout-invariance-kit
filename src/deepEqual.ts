@@ -123,6 +123,43 @@ const objectToString = methodOf(Object.prototype, "toString") as Intrinsic;
 const propertyIsEnumerable = methodOf(Object.prototype, "propertyIsEnumerable") as Intrinsic;
 const hasOwnProperty = methodOf(Object.prototype, "hasOwnProperty") as Intrinsic;
 
+/** Internal. Every typed array type a runtime may have, by constructor name. */
+export const TYPED_ARRAY_NAMES = [
+  "Int8Array",
+  "Uint8Array",
+  "Uint8ClampedArray",
+  "Int16Array",
+  "Uint16Array",
+  "Int32Array",
+  "Uint32Array",
+  "Float16Array",
+  "Float32Array",
+  "Float64Array",
+  "BigInt64Array",
+  "BigUint64Array",
+] as const;
+
+/** Built-ins whose state lives in internal slots, by constructor name. */
+const SLOT_BUILTINS = [
+  "Map",
+  "Set",
+  "WeakMap",
+  "WeakSet",
+  "WeakRef",
+  "FinalizationRegistry",
+  "Promise",
+  "Date",
+  "RegExp",
+  "ArrayBuffer",
+  "SharedArrayBuffer",
+  "DataView",
+  "Number",
+  "String",
+  "Boolean",
+  "Symbol",
+  "BigInt",
+];
+
 /**
  * Prototypes of built-ins whose state lives in internal slots. A value that
  * is one of these prototypes, or inherits from one but fails its brand check
@@ -130,30 +167,44 @@ const hasOwnProperty = methodOf(Object.prototype, "hasOwnProperty") as Intrinsic
  * has no side-effect free brand check) is not comparable.
  */
 const slotPrototypes = new Set<object>(
-  [
-    "Map",
-    "Set",
-    "WeakMap",
-    "WeakSet",
-    "WeakRef",
-    "FinalizationRegistry",
-    "Promise",
-    "Date",
-    "RegExp",
-    "ArrayBuffer",
-    "SharedArrayBuffer",
-    "DataView",
-    "Number",
-    "String",
-    "Boolean",
-    "Symbol",
-    "BigInt",
-  ].flatMap((name) => {
+  SLOT_BUILTINS.flatMap((name) => {
     const proto = protoOf(name);
     return proto === undefined ? [] : [proto];
   }),
 );
 slotPrototypes.add(TypedArrayPrototype);
+
+/**
+ * The same built-ins by name, used to recognize them from another realm
+ * (a `node:vm` context, an iframe), whose prototypes are different objects.
+ * "TypedArray" is the name of the shared typed-array constructor.
+ */
+const slotBuiltinNames = new Set<string>([...SLOT_BUILTINS, ...TYPED_ARRAY_NAMES, "TypedArray"]);
+
+const functionToString = methodOf(Function.prototype, "toString") as Intrinsic;
+const NATIVE_CODE = /\{\s*\[native code\]\s*\}\s*$/;
+
+/**
+ * "Error" or "Slot" if `fn` is a built-in constructor from any realm: a
+ * native function named "Error" or named like one of the slot built-ins.
+ * A user class that is merely named `Map` is not native, so it does not
+ * count. Reads own data descriptors only.
+ */
+function builtinConstructorKind(fn: unknown): "Error" | "Slot" | undefined {
+  if (typeof fn !== "function") return undefined;
+  const name = ownDescriptor(fn, "name")?.value;
+  if (typeof name !== "string" || (name !== "Error" && !slotBuiltinNames.has(name))) return undefined;
+  const source = functionToString(fn);
+  if (typeof source !== "string" || !NATIVE_CODE.test(source)) return undefined;
+  return name === "Error" ? "Error" : "Slot";
+}
+
+/** "Error" or "Slot" if `object` is the `prototype` of a built-in constructor from any realm. */
+function builtinPrototypeKind(object: object): "Error" | "Slot" | undefined {
+  const ctor = ownDescriptor(object, "constructor")?.value;
+  if (typeof ctor !== "function" || ownDescriptor(ctor, "prototype")?.value !== object) return undefined;
+  return builtinConstructorKind(ctor);
+}
 
 // ---------------------------------------------------------------------------
 // Classification.
@@ -239,10 +290,11 @@ function brandOf(value: object): Brand {
 const MAX_PROTOTYPE_CHAIN = 10_000;
 
 /**
- * For a value with no built-in brand: "Error" if `Error.prototype` is on its
- * chain; "Opaque" if the chain holds a slot built-in's prototype or any
- * string (or getter) `Symbol.toStringTag`; otherwise undefined. Reads
- * property descriptors only, so no tag getter ever runs.
+ * For a value with no built-in brand: "Error" if an `Error.prototype` (from
+ * any realm) is on its chain; "Opaque" if the chain holds a slot built-in's
+ * prototype (from any realm) or any string (or getter) `Symbol.toStringTag`;
+ * otherwise undefined. Reads property descriptors only, so no tag getter
+ * ever runs.
  */
 function classifyByChain(value: object): "Error" | "Opaque" | undefined {
   let isError = false;
@@ -257,9 +309,23 @@ function classifyByChain(value: object): "Error" | "Opaque" | undefined {
     if (tag !== undefined && (typeof tag.value === "string" || tag.get !== undefined || tag.set !== undefined)) {
       notComparable = true;
     }
+    const builtin = builtinPrototypeKind(object);
+    if (builtin === "Error") isError = true;
+    if (builtin === "Slot") notComparable = true;
   }
   if (isError) return "Error";
   return notComparable ? "Opaque" : undefined;
+}
+
+/**
+ * True if a value's inherited `constructor` is a built-in (from any realm)
+ * that its prototype chain did not show: a Proxy whose `getPrototypeOf`
+ * trap hides the Date inside it. An own `constructor` property is data and
+ * is compared like any other key.
+ */
+function constructorClaimsBuiltin(value: object): boolean {
+  if (Object.getOwnPropertyDescriptor(value, "constructor") !== undefined) return false;
+  return builtinConstructorKind(read(value, "constructor")) !== undefined;
 }
 
 function classify(value: object): Kind {
@@ -270,16 +336,21 @@ function classify(value: object): Kind {
   if (brand !== "None") return brand;
   const byChain = classifyByChain(value);
   if (byChain !== undefined) return byChain;
+  if (constructorClaimsBuiltin(value)) return "Opaque";
   // With no tag anywhere on the chain, Object.prototype.toString reports the
-  // engine's own tag: an `arguments` object, or an Error from another realm
-  // (which has none of this realm's prototypes).
+  // engine's own tag: an `arguments` object, or an Error whose prototype was
+  // replaced. Any other built-in tag here comes from a value that failed that
+  // built-in's brand check (a Proxy that answers `Symbol.toStringTag`), so it
+  // is not comparable rather than an ordinary object.
   switch (objectToString(value)) {
+    case "[object Object]":
+      return "Object";
     case "[object Arguments]":
       return "Arguments";
     case "[object Error]":
       return "Error";
     default:
-      return "Object";
+      return "Opaque";
   }
 }
 
@@ -441,20 +512,36 @@ function isIdentityKey(value: unknown): boolean {
  * `DataView` whose buffer was detached, any object that has its own or an
  * inherited string `Symbol.toStringTag` without being one of the built-ins
  * above (`URL`, some decimal and date library classes), a built-in's
- * prototype object itself (`Date.prototype`), any object that inherits from
- * a built-in's prototype without being that built-in (a `Proxy` around a
- * `Map`, `Object.create(Date.prototype)`), and any object
- * whose classification throws (a revoked `Proxy`). Compare those with a
- * custom `isEqual`.
+ * prototype object itself (`Date.prototype`), and any object that looks like
+ * one of the built-ins above but fails its brand check. "Looks like" means a
+ * built-in's prototype on its chain, from this realm or another (a `node:vm`
+ * context, an iframe); an inherited `constructor` that is a built-in; or an
+ * `Object.prototype.toString` tag other than `Object`, `Arguments` or
+ * `Error`. So a `Proxy` around a `Date`, `Map`, `Number` or typed array
+ * (from any realm), `Object.create(Date.prototype)`, and an old-style
+ * subclass whose instances never got the internal slot are all not
+ * comparable. A user class that is merely named `Map` or `Date` is an
+ * ordinary class. Also not comparable: any object whose classification
+ * throws (a revoked `Proxy`). Compare those with a custom `isEqual`.
+ *
+ * An `Error`'s state is ordinary properties, so anything with an
+ * `Error.prototype` (from any realm) on its chain, including a `Proxy`
+ * around an `Error`, is compared as an `Error` by those properties.
  *
  * Known gaps: a `Promise` whose prototype was replaced is compared as an
- * ordinary object (there is no side-effect-free way to recognize one).
+ * ordinary object (there is no side-effect-free way to recognize one), and
+ * so is a `Proxy` whose traps hide both its prototype and its `constructor`.
+ * Private `#fields` are never read, so two class instances whose state lives
+ * only in private fields compare equal when their public properties match.
  *
  * An own `__proto__` key (from `JSON.parse`) is compared like any other key.
  * Never mutates its arguments. It reads (and so runs the getters of) only
- * the own enumerable properties it compares, plus `name` and `message` on
- * errors; an error thrown by such a getter or by a `Proxy` trap propagates.
- * Each object's brand is checked once and cached.
+ * the own enumerable properties it compares, `name` and `message` on
+ * errors, and the inherited `constructor` of an object it would otherwise
+ * compare as a plain object or class instance; an error thrown by such a
+ * getter or by a `Proxy` trap propagates (except while classifying, where
+ * it makes the value not comparable). Each object's brand is checked once
+ * and cached.
  */
 export function deepEqual(a: unknown, b: unknown): boolean {
   return equal(a, b, new WeakMap());

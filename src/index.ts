@@ -323,9 +323,9 @@ export function assertPayoutInvariance<TInput, TResult>(
     if (isThenable(output)) {
       throw new TypeError(
         `assertPayoutInvariance: rankFn returned a Promise (or thenable) ${where}. assertPayoutInvariance ` +
-          `is synchronous and would compare two Promise objects (which are always "equal" once their own ` +
-          `properties are compared), not the values they resolve to. Await rankFn yourself and pass the ` +
-          `resolved value in. See README.md, "Async ranking functions".`,
+          `is synchronous and would compare two Promise objects, not the values they resolve to (and each ` +
+          `Promise is equal only to itself, since its state cannot be read). Await rankFn yourself and pass ` +
+          `the resolved value in. See README.md, "Async ranking functions".`,
       );
     }
     return output as TResult;
@@ -423,16 +423,16 @@ export interface AssertNoPayoutImportsOptions {
    * before matching, so a comment that merely MENTIONS a forbidden
    * identifier doesn't count as a reference. A removed block comment leaves
    * a space behind, so `return/* x *\/commission` still shows `commission`
-   * as its own word, and line numbers stay the same. String and template
-   * literals on the same line are tracked so a `//` inside one (e.g.
-   * `"https://example.com/payout"`) is not mistaken for the start of a line
-   * comment. This is still a best-effort, line-based strip (not a real
-   * parser) — see README.md "Honest limits": a string or template literal
-   * that spans multiple lines is not tracked across the line break, and a
-   * regular-expression literal containing `/*` or `//` (such as `/[/*]/`)
-   * is mistaken for the start of a comment, which can hide the code after
-   * it. Pass `false` for files like that. Must be a boolean when given.
-   * Defaults to true.
+   * as its own word, and line numbers stay the same. Strings, template
+   * literals (across lines, including nested `${ }` expressions) and regex
+   * literals are skipped, so a `//` or `/*` inside one (e.g.
+   * `"https://example.com/payout"`, or `rm -rf dist/*` in a template) is not
+   * mistaken for a comment. This is a small lexer, not a parser — see
+   * README.md "Honest limits": a regex literal right after `)` or `]` is
+   * read as division, and a lone backtick in JSX text opens a template that
+   * never closes; after either, a `/*` can hide the code that follows. Pass
+   * `false` for files like that. Must be a boolean when given. Defaults to
+   * true.
    */
   stripComments?: boolean;
   /**
@@ -473,76 +473,176 @@ function toMatcher(identifier: string, caseInsensitive: boolean): RegExp {
   return new RegExp(`\\b${escapeRegExp(identifier)}\\b`, flags);
 }
 
+/** Keywords after which a `/` starts a regular expression, not a division. */
+const REGEX_AFTER_KEYWORD = new Set([
+  "return",
+  "typeof",
+  "instanceof",
+  "in",
+  "of",
+  "new",
+  "delete",
+  "void",
+  "throw",
+  "case",
+  "do",
+  "else",
+  "yield",
+  "await",
+]);
+
+/** Punctuators after which a `/` starts a regular expression, not a division. */
+const REGEX_AFTER_PUNCTUATOR = new Set([..."(,=:[!&|?{};+-*%<>~^}"]);
+
+function isWordChar(ch: string): boolean {
+  return /[\p{ID_Continue}$]/u.test(ch);
+}
+
+/** Index just past a quoted string that starts at `start`, or of the line break that ends it unterminated. */
+function endOfQuoted(src: string, start: number, quote: string): number {
+  let j = start + 1;
+  while (j < src.length) {
+    const ch = src.charAt(j);
+    if (ch === "\\") {
+      j += 2; // an escape, including a line continuation
+      continue;
+    }
+    if (ch === quote) return j + 1;
+    if (ch === "\n") return j;
+    j += 1;
+  }
+  return src.length;
+}
+
+/** Index just past a regex literal that starts at `start`, or of the line break that ends it unterminated. */
+function endOfRegex(src: string, start: number): number {
+  let inClass = false;
+  let j = start + 1;
+  while (j < src.length) {
+    const ch = src.charAt(j);
+    if (ch === "\n") return j;
+    if (ch === "\\") {
+      if (src.charAt(j + 1) === "\n") return j + 1;
+      j += 2;
+      continue;
+    }
+    if (ch === "[") inClass = true;
+    else if (ch === "]") inClass = false;
+    else if (ch === "/" && !inClass) return j + 1;
+    j += 1;
+  }
+  return src.length;
+}
+
+/** An open template literal, or a `${ }` expression inside one (with the `{` opened inside it). */
+type LexFrame = { kind: "template" } | { kind: "expression"; braces: number };
+
 /**
- * Strip `//` line comments and lines that are purely part of a block
- * comment, while tracking same-line single/double-quoted and template
- * string literals so a `//` or `/*` sequence inside one is not mistaken for
- * the start of a comment (e.g. a URL like `"https://host/payout"`, or a
- * `/* not a comment *\/`-looking substring inside a string). A string that
- * itself spans multiple lines (an unterminated literal, or a multi-line
- * template literal) is not tracked past the line break — this remains a
- * best-effort, line-based strip, not a real parser. A block comment is
- * replaced by one space (never by nothing), so the tokens on either side of
- * it stay separate. A regular-expression literal that contains `/*` or `//`
- * is not recognized and is treated as a comment start.
+ * Remove `//` line comments and block comments, keeping everything else,
+ * including every line break, so line numbers do not move. A small lexer, not
+ * a parser: it skips single- and double-quoted strings (which end at a line
+ * break), template literals across lines (including nested `${ }`
+ * expressions, with brace depth tracked, and the strings, templates and
+ * comments inside them), and regular-expression literals, so a `//` or `/*`
+ * inside any of those is not mistaken for a comment. A `/` starts a regex
+ * literal when it follows an operator, an opening bracket, `;`, `}`, the
+ * start of the file, or a keyword such as `return`; otherwise it is division.
+ * A block comment is replaced by one space (never by nothing), so the tokens
+ * on either side of it stay separate.
+ *
+ * Known limits: a regex literal right after `)` or `]` (`if (ok) /re/`) is
+ * read as division, and a lone backtick in JSX text opens a template literal
+ * that never closes. Either can desynchronize the lexer, and a later `/*` can
+ * then hide the code after it.
  */
-function stripCommentLines(src: string): string {
-  let inBlockComment = false;
-  return src
-    .split("\n")
-    .map((rawLine) => {
-      let out = "";
-      let inString: string | null = null;
-      let i = 0;
-      while (i < rawLine.length) {
-        // .charAt() always returns `string` (empty past the end), unlike
-        // indexed access, which TypeScript would otherwise widen to
-        // `string | undefined` under noUncheckedIndexedAccess.
-        const ch = rawLine.charAt(i);
-        const next = rawLine.charAt(i + 1);
+function removeComments(src: string): string {
+  const frames: LexFrame[] = [];
+  let out = "";
+  let prev = ""; // last significant code character ("" at the start of the file)
+  let word = ""; // the identifier or keyword that ends at `prev`
+  let i = 0;
+  while (i < src.length) {
+    const ch = src.charAt(i);
+    const frame = frames.at(-1);
 
-        if (inBlockComment) {
-          const end = rawLine.indexOf("*/", i);
-          if (end === -1) return out; // rest of the line is inside the block comment
-          i = end + 2;
-          inBlockComment = false;
-          continue;
-        }
-
-        if (inString !== null) {
-          out += ch;
-          if (ch === "\\" && next !== "") {
-            out += next;
-            i += 2;
-            continue;
-          }
-          if (ch === inString) inString = null;
-          i += 1;
-          continue;
-        }
-
-        if (ch === "/" && next === "/") return out; // rest of the line is a line comment
-        if (ch === "/" && next === "*") {
-          // Leave a space where the comment was, so `return/* x */commission`
-          // still reads as two tokens (and `pay/* x */out` does not become one).
-          out += " ";
-          inBlockComment = true;
-          i += 2;
-          continue;
-        }
-        if (ch === "'" || ch === '"' || ch === "`") {
-          inString = ch;
-          out += ch;
-          i += 1;
-          continue;
-        }
-
+    if (frame?.kind === "template") {
+      if (ch === "\\") {
+        out += src.slice(i, i + 2);
+        i += 2;
+      } else if (ch === "`") {
+        frames.pop();
+        out += ch;
+        prev = ch;
+        i += 1;
+      } else if (ch === "$" && src.charAt(i + 1) === "{") {
+        frames.push({ kind: "expression", braces: 0 });
+        out += "${";
+        prev = "{";
+        i += 2;
+      } else {
         out += ch;
         i += 1;
       }
-      return out;
-    })
-    .join("\n");
+      continue;
+    }
+
+    const next = src.charAt(i + 1);
+    if (ch === "/" && next === "/") {
+      const end = src.indexOf("\n", i);
+      i = end === -1 ? src.length : end; // keep the line break itself
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? src.length : end;
+      // Leave a space where the comment was, so `return/* x */commission`
+      // still reads as two tokens (and `pay/* x */out` does not become one),
+      // plus the comment's own line breaks.
+      out += " " + src.slice(i + 2, stop).replace(/[^\n]/g, "");
+      i = end === -1 ? src.length : end + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const end = endOfQuoted(src, i, ch);
+      out += src.slice(i, end);
+      prev = ch;
+      i = end;
+      continue;
+    }
+    if (ch === "`") {
+      frames.push({ kind: "template" });
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && (prev === "" || (isWordChar(prev) ? REGEX_AFTER_KEYWORD.has(word) : REGEX_AFTER_PUNCTUATOR.has(prev)))) {
+      const end = endOfRegex(src, i);
+      out += src.slice(i, end);
+      prev = ")"; // a `/` right after a regex literal divides
+      i = end;
+      continue;
+    }
+    if (frame?.kind === "expression") {
+      if (ch === "{") {
+        frame.braces += 1;
+      } else if (ch === "}") {
+        if (frame.braces === 0) {
+          frames.pop(); // back inside the template
+          out += ch;
+          i += 1;
+          continue;
+        }
+        frame.braces -= 1;
+      }
+    }
+    if (!/\s/.test(ch)) {
+      word = isWordChar(ch) ? (isWordChar(src.charAt(i - 1)) ? word + ch : ch) : "";
+      prev = ch;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
 }
 
 /**
@@ -710,7 +810,7 @@ export function assertNoPayoutImports(
   const offenses: PayoutImportOffense[] = [];
 
   for (const [path, rawContent] of sources) {
-    const content = stripComments ? stripCommentLines(rawContent) : rawContent;
+    const content = stripComments ? removeComments(rawContent) : rawContent;
     const lines = content.split("\n");
     const matches: PayoutImportOffense["matches"] = [];
 
