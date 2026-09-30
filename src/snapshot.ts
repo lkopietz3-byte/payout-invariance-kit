@@ -35,6 +35,7 @@ import {
   regExpParts,
   registerBrand,
   setValues,
+  TYPED_ARRAY_NAMES,
   typedArrayLength,
   typedArrayName,
 } from "./deepEqual.js";
@@ -43,20 +44,7 @@ type TypedArrayConstructor = new (length: number) => object;
 
 /** Every typed array constructor this runtime has, by the name its brand reports. */
 const typedArrayConstructors = new Map<string, TypedArrayConstructor>();
-for (const name of [
-  "Int8Array",
-  "Uint8Array",
-  "Uint8ClampedArray",
-  "Int16Array",
-  "Uint16Array",
-  "Int32Array",
-  "Uint32Array",
-  "Float16Array",
-  "Float32Array",
-  "Float64Array",
-  "BigInt64Array",
-  "BigUint64Array",
-]) {
+for (const name of TYPED_ARRAY_NAMES) {
   const candidate: unknown = Reflect.get(globalThis, name);
   if (typeof candidate === "function") typedArrayConstructors.set(name, candidate as TypedArrayConstructor);
 }
