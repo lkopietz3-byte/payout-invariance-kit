@@ -39,6 +39,30 @@ different (stricter) answer, so this is a minor release.
 - Error messages escape scenario names and thrown messages (newlines,
   control and bidi characters), and a thrown value that cannot be printed
   no longer breaks the message.
+- `deepEqual` compared a value that looks like a built-in but fails its
+  brand check as an ordinary object when the resemblance came from another
+  realm or was hidden. From another realm (a `node:vm` context): a `Proxy`
+  around a `Date`, `Number`, `Boolean`, `String` or `RegExp`,
+  `Object.create()` of its `Date.prototype`, or an old-style subclass whose
+  instances never got the internal slot. From any realm: a `Proxy` whose
+  `getPrototypeOf` trap hides a `Date`, or a `Proxy` that answers
+  `Symbol.toStringTag`. So another realm's `new Proxy(new Date(1), {})`
+  equaled `new Proxy(new Date(2), {})`. Such values are now not comparable
+  (equal only to themselves). A built-in is recognized from any realm by
+  its native constructor's name; a user class merely named `Map` is still
+  an ordinary class. An `Error`-like value from any realm, including a
+  `Proxy` around one, is compared as an `Error` by `name`, `message`,
+  `cause` and `errors`.
+- The comment stripper tracked strings one line at a time, so a
+  multi-line template literal holding an unclosed `/*` (such as
+  `rm -rf dist/*`) hid every later line, and `` `${"`"}` + "/*" `` did the
+  same on one line; a later `o.payout` was missed. It is now a small
+  whole-file lexer that skips strings, template literals across lines
+  (with nested `${ }` expressions) and regex literals in expression
+  position, so `/[/*]/` after `=` no longer opens a comment either.
+- The error thrown when `rankFn` returns a Promise said two Promises are
+  always equal once their own properties are compared. A Promise is not
+  comparable (equal only to itself); the message now says so.
 
 ### Changed
 
@@ -57,6 +81,11 @@ different (stricter) answer, so this is a minor release.
   runs the dependency audit, verify and attw, and treats only a confirmed
   E404 as "not published". CI adds Node 20.19.0 and 22.12.0 compatibility
   jobs.
+- README "Honest limits" now states the known false passes: state kept
+  only in private `#fields` (with the fix: an `isEqual` that compares the
+  getters, or plain data), and one shared `Error`, `DataView` or boxed
+  primitive returned and edited on every call. The comment-stripper limits
+  are restated for the new lexer.
 
 ### Added
 
