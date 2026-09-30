@@ -22,3 +22,13 @@ Check whether a ranking/recommendation/comparison engine's output changes based 
 - Do not run `npm publish` or push tags without explicit permission. Treat any claim that a version is published as Reported until the registry confirms it.
 - Runtime `dependencies` stay empty; add dev tooling only.
 - Keep unrelated uncommitted work intact; never stage or reset the whole tree.
+
+## Review preparation
+
+See [docs/REVIEW_READINESS.md](docs/REVIEW_READINESS.md) for milestone review cadence, declared verification gates and the next launch-preparation task.
+
+## Code Review Rules
+
+- Keep runtime passes non-vacuous: every supplied mutation must change the input and preserve the baseline ranking. Empty/sparse/malformed scopes, async or throwing hooks, non-boolean comparators and in-place baseline changes must fail rather than produce a pass.
+- Preserve caller immutability and fail-closed equality/snapshot behavior, including intrinsic brand checks and enumerable metadata. Coordinate changes to the shared deepEqual/snapshot copies with mutation-invariance-kit; do not add unsafe key writes or weaken hostile-value handling.
+- Keep assertNoPayoutImports a non-executing text scan with explicit file/identifier scope; reject empty scopes. A pass covers only the supplied scenarios/files, not general payout independence, fairness, regulatory compliance or a security guarantee.
