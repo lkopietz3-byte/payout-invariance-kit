@@ -308,10 +308,13 @@ import-path segment, e.g. `"commission"` catches `import { commission } from
 `RegExp` for anything more specific. Line comments and block comments are
 stripped before matching by default (`opts.stripComments`, default `true`),
 so a comment that merely *mentions* a forbidden word doesn't count as a
-reference — a same-line string or template literal (e.g. a URL like
-`"https://api.example.com/payout"`) is tracked too, so a `//` inside one
-isn't mistaken for the start of a line comment. A removed block comment
-leaves a space behind, so `return/* note */commission` is still found.
+reference. The stripper is a small lexer: it skips strings, template
+literals (across lines, including nested `${ }` expressions) and regex
+literals, so a `//` or `/*` inside one (a URL like
+`"https://api.example.com/payout"`, a shell glob like `rm -rf dist/*` in a
+template) isn't mistaken for a comment. A removed block comment leaves a
+space behind, so `return/* note */commission` is still found, and line
+numbers never move.
 
 It throws a `TypeError`, before reading any file, instead of returning a
 clean-looking `[]` for a scan that could not mean anything: an empty `files`
@@ -397,12 +400,12 @@ cannot see:
   token. Pass a `RegExp` without a word boundary (e.g. `/payout/i`) if you
   need substring-level matching, or name your real payout fields so they
   appear as their own token somewhere reachable by the grep.
-- A string or template literal that itself spans multiple lines — same-line
-  string tracking (used so a `//` inside a URL isn't mistaken for a
-  comment) is not carried across a line break.
-- A regular-expression literal that contains `/*` or `//`, such as
-  `/[/*]/`. The comment stripper cannot tell it from a comment, so it can
-  hide the code after it until the next `*/`. Pass
+- Code after a spot where the comment stripper loses track. It is a
+  lexer, not a parser, and it guesses whether a `/` starts a regex literal
+  from the character before it: a regex right after `)` or `]` (such as
+  `if (ok) /[/*]/.test(s)`) is read as division, and a lone backtick in JSX
+  text opens a template literal that never closes. After either, a `/*`
+  can hide the code that follows until the next `*/`. Pass
   `{ stripComments: false }` for files like that (comments are then scanned
   too, so a comment that mentions a forbidden word counts).
 

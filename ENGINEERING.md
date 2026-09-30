@@ -63,9 +63,10 @@ has a regression test that failed against the pre-fix commit.
   `Promise`, private fields).
 - A `Promise` whose prototype was replaced is compared as an ordinary
   object; there is no side-effect-free brand check for promises.
-- `assertNoPayoutImports`'s same-line string tracking is not carried across
-  a line break, and a regular-expression literal containing `/*` or `//` is
-  mistaken for a comment start, so either can hide code from the check.
+- `assertNoPayoutImports`'s comment stripper is a lexer, not a parser: a
+  regex literal right after `)` or `]` is read as division, and a lone
+  backtick in JSX text opens a template that never closes, so either can
+  hide code from the check.
 
 ## Are the types wrong? (attw)
 

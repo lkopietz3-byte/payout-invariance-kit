@@ -185,8 +185,13 @@ describe("assertNoPayoutImports: comment stripping keeps token boundaries (PIK-0
     ]);
   });
 
-  it("documents the regex-literal limit (R06): /[/*]/ opens a comment unless stripComments is false", () => {
+  it("skips a regex literal in expression position (R06): /[/*]/ no longer opens a comment", () => {
     const files = { "a.ts": "const re = /[/*]/;\nconst x = commission;\n// */" };
+    expect(assertNoPayoutImports(files, ["commission"])).toHaveLength(1);
+  });
+
+  it("documents the remaining limit: a regex right after ')' reads as division, so its '/*' opens a comment", () => {
+    const files = { "a.ts": "if (ok) /[/*]/.test(s);\nconst x = commission;\n// */" };
     expect(assertNoPayoutImports(files, ["commission"])).toEqual([]);
     expect(assertNoPayoutImports(files, ["commission"], { stripComments: false })).toHaveLength(1);
   });
