@@ -1,5 +1,7 @@
 # payout-invariance-kit
 
+**[Try it in your browser →](https://lkopietz3-byte.github.io/honesty-kits/#payout-invariance-kit)** · Part of [honesty kits](https://github.com/lkopietz3-byte/honesty-kits), a family of small checks for the claims an AI product makes.
+
 Two small, zero-dependency, framework-agnostic TypeScript checks for a
 ranking, recommendation, or comparison engine — a job board, a marketplace,
 an insurance or real-estate comparison site, a review aggregator, a
