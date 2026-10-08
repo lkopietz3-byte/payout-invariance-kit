@@ -1,6 +1,6 @@
 {
   "name": "payout-invariance-kit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Check whether a ranking/recommendation/comparison engine's output changes based on which option pays the operator more — a runtime mutation check plus a static import check, both framework-agnostic.",
   "keywords": [
     "affiliate-neutrality",
@@ -9,7 +9,8 @@
     "testing",
     "honesty",
     "property-testing",
-    "vitest"
+    "vitest",
+    "honesty-kits"
   ],
   "author": "Lucas Kopietz",
   "license": "MIT",
@@ -17,7 +18,7 @@
     "type": "git",
     "url": "git+https://github.com/lkopietz3-byte/payout-invariance-kit.git"
   },
-  "homepage": "https://github.com/lkopietz3-byte/payout-invariance-kit#readme",
+  "homepage": "https://lkopietz3-byte.github.io/honesty-kits/#payout-invariance-kit",
   "bugs": {
     "url": "https://github.com/lkopietz3-byte/payout-invariance-kit/issues"
   },
