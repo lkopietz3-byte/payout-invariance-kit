@@ -39,6 +39,19 @@ so the next release should be a minor version. No version bump here.
   class-instance input, because `structuredClone` drops the prototype. It now
   throws a `TypeError` saying the input must be plain data.
 
+- An empty match from a Unicode (`u` or `v`) RegExp identifier before an
+  astral character (an emoji) looped forever. Empty matches now step over a
+  whole code point.
+- The comment stripper hid real code after a regex written directly after `<`
+  (`a</[/*]/.test(b)`, `n</^https?:\/\//.test(u)`), after a regex following a
+  statement block when it began with a space or `=` (`if (x) {} / [/*]/`), and
+  after a prefix `++` (`++/re/.lastIndex`). A `</` is now a closing tag only
+  when a tag name and `>` follow, a `}` is classified as closing a statement
+  block or an expression, and `++`/`--` are postfix only after an operand.
+- `payout` written directly against Chinese, Japanese or Korean text
+  (`t('查看payout报表')`) or `²`/`½` was not found, because those counted as word
+  characters. For an identifier with an ASCII edge they no longer do.
+
 ### Changed (behavior)
 
 - New option `orderSensitive` (default `false`) on `assertPayoutInvariance` and
@@ -66,6 +79,8 @@ so the next release should be a minor version. No version bump here.
 - `opts.caseInsensitive` (default `true`; applies to string identifiers in any
   script, not to `RegExp` entries) and the other `assertNoPayoutImports` rules
   above are in the README.
+- A mixed identifier such as `payout报表` is reported for `"payout"` (the cost
+  of finding it in UI strings). A non-ASCII identifier stays strict.
 - Lexer limits that remain: a regex right after `)` or `]` is read as division,
   a lone backtick in JSX text opens a template that never closes, and JSX text
   is not tokenized (a `//` in it starts a comment). No Unicode normalization is

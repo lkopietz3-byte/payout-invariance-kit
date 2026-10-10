@@ -7,6 +7,12 @@
  * Static cases use the verdict words FLAG (assertNoPayoutImports reports the
  * file) and CLEAN (it reports nothing). Runtime cases use PASS and FAIL.
  */
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import { assertNoPayoutImports, assertPayoutInvariance, deepEqual } from "../src/index";
@@ -187,6 +193,83 @@ describe("verdict table: static, self-hunt probes", () => {
     { name: "a space after the slash following } is division, then a comment", source: "const t = <b>{a} / {b}</b>; // payout\n", identifiers: ["payout"], expected: "CLEAN" },
     { name: "/= after } is division, then a comment", source: "const t = {a: 1}; t.a /= 2; x = {} /= 2; // payout\n", identifiers: ["payout"], expected: "CLEAN" },
     { name: "// inside JSX text is read as a comment (documented)", source: "const a = <p>Split 50/50 // not a comment? payout</p>;\n", identifiers: ["payout"], expected: "CLEAN" },
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// Review round: empty matches, regex after `<`, regex after a block, prefix
+// ++, and identifiers written against CJK text.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a snippet against a fresh transpile of src/ in a child process, so a
+ * hang is a failed test (the child is killed at the timeout) instead of a
+ * frozen test run.
+ */
+function runIsolated(snippet: string, timeoutMs: number): { status: number | null; stdout: string } {
+  const dir = mkdtempSync(join(tmpdir(), "pik-isolated-"));
+  try {
+    for (const file of ["index", "deepEqual", "snapshot"]) {
+      const source = readFileSync(new URL(`../src/${file}.ts`, import.meta.url), "utf8");
+      const out = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
+      writeFileSync(join(dir, `${file}.js`), out.outputText);
+    }
+    writeFileSync(join(dir, "package.json"), '{"type":"module"}');
+    writeFileSync(join(dir, "probe.js"), `import * as k from "./index.js";\n${snippet}`);
+    const run = spawnSync(process.execPath, [join(dir, "probe.js")], { timeout: timeoutMs, encoding: "utf8" });
+    return { status: run.status, stdout: run.stdout };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("verdict table: static, review round", () => {
+  it("an empty match from a Unicode RegExp before an astral character terminates and is reported -> FLAG", () => {
+    const run = runIsolated(
+      'const r = k.assertNoPayoutImports({ "f.ts": "a\u{1F600}b" }, [/(?:)/u, /(?:)/v]);\nconsole.log(JSON.stringify(r.map((o) => o.matches.map((m) => m.line))));',
+      15000,
+    );
+    expect(run.status).toBe(0);
+    expect(run.stdout.trim()).toBe("[[1,1]]"); // one file, one report per matcher, both on line 1
+  });
+
+  runStaticCases([
+    // Regex directly after `<`: a closing tag needs an identifier (or nothing) and `>`.
+    { name: "regex directly after < is a regex, code after it is scanned", source: "const ok = a</[/*]/.test(b);\nrow.commission;\n/* */", identifiers: ["commission"], expected: "FLAG", lines: [2] },
+    { name: "anchored URL regex directly after < hides nothing", source: "if (n</^https?:\\/\\//.test(url)) row.payout = 1;\n", identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex starting with an identifier directly after < is a regex", source: "const ok = a</foo[/*]/.test(b);\nrow.commission;\n/* */", identifiers: ["commission"], expected: "FLAG", lines: [2] },
+    { name: "fragment closing tag </> then a comment", source: "const a = <><b>x</b></>; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+    { name: "member-name closing tag then a comment", source: "const a = <Ui.Card>x</Ui.Card>; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+    { name: "namespaced closing tag with a space then a comment", source: "const a = <svg:g>x</svg:g >; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+
+    // Regex after a block versus a slash after an expression-ending brace.
+    { name: "regex starting with = after a block is a regex", source: "if (x) { y() } /=[/*]/.test(s); row.commission; /* */\n", identifiers: ["commission"], expected: "FLAG" },
+    { name: "regex starting with a space after a block is a regex", source: "if (x) { y() } / [/*]/.test(s); row.commission; /* */\n", identifiers: ["commission"], expected: "FLAG" },
+    { name: "regex after an else block", source: "if (x) { y() } else { z() } /[/*]/.test(s); row.commission; /* */\n", identifiers: ["commission"], expected: "FLAG" },
+    { name: "regex after an arrow body block", source: "const f = () => { y() }; const g = () => { z() } /[/*]/.test(s); row.commission; /* */\n", identifiers: ["commission"], expected: "FLAG" },
+    { name: "division after an object literal across lines, then a comment", source: "const o = {\n  a: 1,\n}\n/ 2; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+    { name: "division after adjacent JSX expressions, then a comment", source: "const t = <p>{a}{b} / {c}</p>; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+    { name: "division after a spread attribute brace, then a comment", source: "const t = <Foo a {...p} />; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+    { name: "division after a style object brace, then a comment", source: "const t = <b style={{ a: 1 }} />; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+    { name: "division-assign after an empty object, then a comment", source: "x = {} /= 2; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+    { name: "real code after an object literal and division is scanned", source: "const r = ({ a: 1 }).a / 2; const c = row.commission; // note\n", identifiers: ["commission"], expected: "FLAG" },
+
+    // Prefix versus postfix ++.
+    { name: "prefix ++ before a regex is a regex", source: "const n = ++/[/*]/.lastIndex;\nrow.commission;\n/* */", identifiers: ["commission"], expected: "FLAG", lines: [2] },
+    { name: "prefix -- after an operator is a regex", source: "const n = a + --/[/*]/.lastIndex;\nrow.commission;\n/* */", identifiers: ["commission"], expected: "FLAG", lines: [2] },
+    { name: "postfix ++ on an index expression divides", source: "const n = a[0]++ / 2; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+    { name: "postfix -- on a call result divides", source: "const n = f()-- / 2; // commission\n", identifiers: ["commission"], expected: "CLEAN" },
+
+    // Identifiers written against CJK text and other non-identifier characters.
+    { name: "ASCII identifier between CJK characters in a UI string", source: "t('查看payout报表');\n", identifiers: ["payout"], expected: "FLAG" },
+    { name: "ASCII identifier before kana", source: "t('payoutです');\n", identifiers: ["payout"], expected: "FLAG" },
+    { name: "ASCII identifier before a Korean particle", source: "t('payout을 확인');\n", identifiers: ["payout"], expected: "FLAG" },
+    { name: "ASCII identifier before a superscript", source: "const r = payout\u00B2;\n", identifiers: ["payout"], expected: "FLAG" },
+    { name: "ASCII identifier before a vulgar fraction", source: "const r = payout\u00BD;\n", identifiers: ["payout"], expected: "FLAG" },
+    { name: "ASCII identifier before a Cyrillic letter is one word", source: "const payout\u0430 = 1;\n", identifiers: ["payout"], expected: "CLEAN" },
+    { name: "ASCII identifier with a longer ASCII word between CJK text", source: "t('查看payouts报表');\n", identifiers: ["payout"], expected: "CLEAN" },
+    { name: "CJK identifier inside a longer CJK word is not matched (no word breaks in CJK)", source: "const 佣金率 = 1;\n", identifiers: ["佣金"], expected: "CLEAN" },
+    { name: "CJK identifier alone", source: "const 佣金 = 1;\n", identifiers: ["佣金"], expected: "FLAG" },
   ]);
 });
 

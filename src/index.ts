@@ -496,8 +496,17 @@ function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Characters that continue an identifier for word-boundary purposes: letters, digits, combining marks, `_`. */
-const IDENTIFIER_CHARS = "\\p{L}\\p{N}\\p{M}_";
+/** Characters that continue an identifier: letters, decimal and letter-like digits, combining marks, `_`. */
+const IDENTIFIER_CHARS = "\\p{L}\\p{Nd}\\p{Nl}\\p{M}_";
+/**
+ * Scripts written without spaces between words. Text in them runs straight
+ * into an embedded Latin word (`查看payout报表`, `payout을`), so next to an
+ * identifier that starts or ends with an ASCII character they do not count
+ * as part of the same word.
+ */
+const UNSPACED_SCRIPTS = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Hangul}";
+const STARTS_WITH_ASCII_WORD_CHAR = /^[A-Za-z0-9_]/;
+const ENDS_WITH_ASCII_WORD_CHAR = /[A-Za-z0-9_]$/;
 const STARTS_WITH_IDENTIFIER_CHAR = new RegExp(`^[${IDENTIFIER_CHARS}]`, "u");
 const ENDS_WITH_IDENTIFIER_CHAR = new RegExp(`[${IDENTIFIER_CHARS}]$`, "u");
 
@@ -512,14 +521,20 @@ const ENDS_WITH_IDENTIFIER_CHAR = new RegExp(`[${IDENTIFIER_CHARS}]$`, "u");
  * identifier itself starts or ends with such a character, so "$payout",
  * "@payout/core" and "rate%" are found too. `$` does not continue an
  * identifier here, so "payout" is still found in a Svelte-style `$payout`.
- * It will NOT catch this identifier as a fragment of a larger camelCase or
- * snake_case identifier (e.g. "payout" inside "computePayoutForCard" or
- * "payout_rate_bps"), pass a RegExp without a boundary (e.g. /payout/i) for
- * that.
+ * Characters like `²` and `½` are not identifier characters either. On an
+ * ASCII edge, Han, kana and Hangul neighbors do not count as part of the word
+ * (see UNSPACED_SCRIPTS); a non-ASCII identifier edge is strict, so "佣金" is
+ * not found inside "佣金率". It will NOT catch this identifier as a fragment
+ * of a larger camelCase or snake_case identifier (e.g. "payout" inside
+ * "computePayoutForCard" or "payout_rate_bps"); pass a RegExp without a
+ * boundary (e.g. /payout/i) for that.
  */
 function toMatcher(identifier: string, caseInsensitive: boolean): RegExp {
-  const before = STARTS_WITH_IDENTIFIER_CHAR.test(identifier) ? `(?<![${IDENTIFIER_CHARS}])` : "";
-  const after = ENDS_WITH_IDENTIFIER_CHAR.test(identifier) ? `(?![${IDENTIFIER_CHARS}])` : "";
+  const startsWord = STARTS_WITH_IDENTIFIER_CHAR.test(identifier);
+  const endsWord = ENDS_WITH_IDENTIFIER_CHAR.test(identifier);
+  const word = (ascii: boolean): string => (ascii ? `(?![${UNSPACED_SCRIPTS}])[${IDENTIFIER_CHARS}]` : `[${IDENTIFIER_CHARS}]`);
+  const before = startsWord ? `(?<!${word(STARTS_WITH_ASCII_WORD_CHAR.test(identifier))})` : "";
+  const after = endsWord ? `(?!${word(ENDS_WITH_ASCII_WORD_CHAR.test(identifier))})` : "";
   return new RegExp(`${before}${escapeRegExp(identifier)}${after}`, "gu" + (caseInsensitive ? "i" : ""));
 }
 
@@ -601,6 +616,9 @@ function endOfRegex(src: string, start: number): number {
   return src.length;
 }
 
+/** A JSX closing tag, from its `/` on: `/div>`, `/>`, `/Ui.Card >`, `/svg:g>`. */
+const closingTag = /\/\s*(?:[\p{ID_Start}_$][\p{ID_Continue}$.:-]*\s*)?>/uy;
+
 /** An open template literal, or a `${ }` expression inside one (with the `{` opened inside it). */
 type LexFrame = { kind: "template" } | { kind: "expression"; braces: number };
 
@@ -620,15 +638,19 @@ type LexFrame = { kind: "template" } | { kind: "expression"; braces: number };
  * guessed from the code before it:
  * - at the start of the file, after a keyword such as `return`, or after an
  *   operator or opening bracket, it starts a regex;
- * - right after `<` (`</div>`, a JSX closing tag) it does not, but `a < /re/`
- *   with a space does;
- * - after a `}` or `>` it does not when the next character is `>` (a
- *   self-closing tag, `<Foo a={1} />`); after a `}` it does when a line
- *   break came first (a statement that starts with a regex), and otherwise
- *   only when the `/` is not followed by a space or `=` (so `{a} / {b}`
- *   divides and `} /re/.test(s)` is a regex);
- * - after `++` or `--` it does not (`i++ / 2`), but after a single `+` or `-`
- *   it does.
+ * - right after `<` it is part of a closing tag only when a tag name (or
+ *   nothing) and `>` follow (`</div>`, `</>`, `</Ui.Card>`); otherwise
+ *   (`a</[/*]/.test(b)`, or `a < /re/` with a space) it starts a regex;
+ * - after a `}` it starts a regex when the brace closed a statement block
+ *   (`if (x) {...}`, `else {...}`, an arrow body, a bare block) and divides
+ *   when it closed an object literal or JSX expression (`{a} / {b}`,
+ *   `{} /= 2`); a `/` followed by `>` after any `}` is a self-closing tag
+ *   (`<Foo {...p} />`);
+ * - after `>` it does not start a regex when the next character is `>`
+ *   (`<Foo<T> />`) unless a line break came first;
+ * - after `++` or `--` it divides when the operator is postfix (`i++ / 2`,
+ *   `a[0]-- / 2`, judged by what precedes it) and starts a regex when it is
+ *   prefix (`++/re/.lastIndex`); after a single `+` or `-` it starts a regex.
  *
  * Known limits: a regex literal right after `)` or `]` (`if (ok) /re/`) is
  * read as division, JSX text is not tokenized (a `//` in it starts a
@@ -643,26 +665,57 @@ function removeComments(src: string): string {
   let prevIndex = -1; // where `prev` is in `src`, or -1 when it ends a string, template or regex
   let lineBreak = false; // a line terminator came after `prev`
   let word = ""; // the identifier or keyword that ends at `prev`
+  const braces: boolean[] = []; // for each open `{` in code: true when it opens a statement block
+  let closedBlock = true; // whether the `}` that is `prev` closed a statement block
   let i = 0;
+
+  /** True when the `{` being read opens a statement block (`if (x) {`), false for an object literal or JSX expression. */
+  const opensBlock = (): boolean => {
+    if (prev === "") return true;
+    if (isWordChar(prev)) return word === "else" || word === "try" || word === "finally" || word === "do";
+    switch (prev) {
+      case ")":
+      case ";":
+        return true;
+      case "}":
+        return closedBlock; // `} {` after a block is a block; `{a}{b}` in JSX is not
+      case "{":
+        return braces.at(-1) ?? true; // directly inside a block is a block; inside an object it is an object
+      case ">":
+        return src.charAt(prevIndex - 1) === "="; // `=> {` is a body, `<p>{` is a JSX expression
+      default:
+        return false;
+    }
+  };
+
+  /** True when the `++` or `--` that ends at `prev` is postfix (`i++`, `a[0]--`), judged by what precedes it. */
+  const isPostfixStep = (): boolean => {
+    let j = prevIndex - 2;
+    while (j >= 0 && /\s/.test(src.charAt(j))) j -= 1;
+    const before = j >= 0 ? src.charAt(j) : "";
+    return before === ")" || before === "]" || (before !== "" && isWordChar(before));
+  };
 
   /** True when a `/` at index `at` starts a regex literal rather than dividing. */
   const startsRegex = (at: number): boolean => {
     if (prev === "") return true;
     if (isWordChar(prev)) return REGEX_AFTER_KEYWORD.has(word);
     if (!REGEX_AFTER_PUNCTUATOR.has(prev)) return false;
-    const adjacent = prevIndex === at - 1;
     switch (prev) {
-      case "<":
-        return !adjacent; // `</div>` closes a tag
+      case "<": {
+        // `</div>`, `</>` and `</a.b>` close a JSX tag. Anything else after `</` is a regex.
+        if (prevIndex !== at - 1) return true;
+        closingTag.lastIndex = at;
+        return !closingTag.test(src);
+      }
       case "}":
-        if (src.charAt(at + 1) === ">") return false; // `<Foo a={1} />`
-        if (lineBreak) return true; // a statement on a later line starts a regex
-        return !/[\s=]/.test(src.charAt(at + 1)); // `{a} / {b}` and `/=` divide; `} /re/.test(s)` is a regex
+        if (src.charAt(at + 1) === ">") return false; // `<Foo {...p} />`
+        return closedBlock; // after a statement block a slash starts a regex; after an expression it divides
       case ">":
         return src.charAt(at + 1) !== ">" || lineBreak; // `<Foo<T> />`
       case "+":
       case "-":
-        return !(prevIndex > 0 && src.charAt(prevIndex - 1) === prev); // `i++ / 2` divides
+        return !(prevIndex > 0 && src.charAt(prevIndex - 1) === prev && isPostfixStep()); // `i++ / 2` divides
       default:
         return true;
     }
@@ -752,6 +805,8 @@ function removeComments(src: string): string {
       }
     }
     if (!/\s/.test(ch)) {
+      if (ch === "{") braces.push(opensBlock());
+      else if (ch === "}") closedBlock = braces.pop() ?? true;
       word = isWordChar(ch) ? (isWordChar(src.charAt(i - 1)) ? word + ch : ch) : "";
       prev = ch;
       prevIndex = i;
@@ -872,7 +927,12 @@ function findMatches(content: string, matchers: { label: string; regex: RegExp }
     let lineIndex = 0;
     let reported = -1;
     for (let hit = regex.exec(content); hit !== null; hit = regex.exec(content)) {
-      if (hit[0] === "") regex.lastIndex += 1; // an empty match must not loop forever
+      if (hit[0] === "") {
+        // An empty match must not loop forever. In a Unicode pattern, step over a whole
+        // code point: stopping inside a surrogate pair makes the next search back up.
+        const unicode = regex.flags.includes("u") || regex.flags.includes("v");
+        regex.lastIndex += unicode && (content.codePointAt(regex.lastIndex) ?? 0) > 0xffff ? 2 : 1;
+      }
       while (lineIndex + 1 < lines.length && (lines[lineIndex + 1]?.start ?? Infinity) <= hit.index) lineIndex += 1;
       if (lineIndex === reported) continue;
       reported = lineIndex;

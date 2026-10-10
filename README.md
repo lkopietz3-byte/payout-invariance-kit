@@ -352,7 +352,14 @@ import-path segment, e.g. `"commission"` catches `import { commission } from
   `"commissionés"`, and an identifier that starts or ends with a symbol
   (`"$payout"`, `"@payout/core"`, `"rate%"`) is found where it appears. `$`
   does not count as an identifier character here, so `"payout"` is still
-  found in a Svelte-style `$payout`. No Unicode normalization is applied:
+  found in a Svelte-style `$payout`. Characters such as `²` and `½` are not
+  identifier characters, so `payout²` is found. Next to an identifier that
+  starts or ends with an ASCII character, Chinese, Japanese and Korean text
+  does not count as part of the word, because those scripts have no spaces
+  (`t('查看payout报表')` and `payout을` are found); a non-ASCII identifier is
+  strict, so `"佣金"` is not found inside `"佣金率"`. The trade-off: a
+  mixed identifier such as `payout报表` is also reported. No Unicode
+  normalization is applied:
   an accented word typed as a base letter plus a combining mark does not
   match its precomposed form, so list both spellings if your code uses both.
 - **`opts.caseInsensitive`** (default `true`) makes string identifiers match
@@ -373,8 +380,11 @@ import-path segment, e.g. `"commission"` catches `import { commission } from
   regex literals, so a `//` or `/*` inside one (a URL like
   `"https://api.example.com/payout"`, a shell glob like `rm -rf dist/*` in a
   template) isn't mistaken for a comment. It also tells JSX apart from
-  division and regex: `</div>`, a self-closing `<Foo a={1} />` and `i++ / 2`
-  are not regex starts, so a comment after them is removed. A removed block
+  division and regex: a closing tag (`</div>`, `</>`), a self-closing
+  `<Foo a={1} />`, `{a} / {b}` after a JSX expression or object literal, and
+  a postfix `i++ / 2` are not regex starts, so a comment after them is
+  removed, while a regex after `a</`, a statement block, a prefix `++` or a
+  single `+` or `-` is still read as a regex and the code after it scanned. A removed block
   comment leaves a space behind, so `return/* note */commission` is still
   found, and line numbers never move.
 
