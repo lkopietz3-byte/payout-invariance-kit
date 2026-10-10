@@ -42,6 +42,8 @@ import {
   regExpParts,
   registerBrand,
   setValues,
+  weakMapGet,
+  weakMapSet,
   TYPED_ARRAY_NAMES,
   typedArrayExtraKeys,
   typedArrayLength,
@@ -52,11 +54,28 @@ import type { Kind } from "./deepEqual.js";
 type TypedArrayConstructor = new (length: number) => object;
 
 /** Every typed array constructor this runtime has, by the name its brand reports. */
-const typedArrayConstructors = new Map<string, TypedArrayConstructor>();
+const typedArrayConstructors = Object.create(null) as Record<string, TypedArrayConstructor | undefined>;
 for (const name of TYPED_ARRAY_NAMES) {
   const candidate: unknown = Reflect.get(globalThis, name);
-  if (typeof candidate === "function") typedArrayConstructors.set(name, candidate as TypedArrayConstructor);
+  if (typeof candidate === "function") typedArrayConstructors[name] = candidate as TypedArrayConstructor;
 }
+
+// Built-ins this file calls while copying, captured once at import (see the
+// "Built-ins and tampering" note in README.md, Honest limits).
+const objectCreate = Object.create;
+const getPrototypeOf = Object.getPrototypeOf;
+const setPrototypeOf = Object.setPrototypeOf;
+const defineProperty = Object.defineProperty;
+const reflectGet = Reflect.get;
+const WeakMapConstructor = WeakMap;
+const Uint8ArrayConstructor = Uint8Array;
+const reflectApply = Reflect.apply;
+const ArrayConstructor = Array;
+const DateConstructor = Date;
+const RegExpConstructor = RegExp;
+const MapConstructor = Map;
+const SetConstructor = Set;
+const ArrayBufferConstructor = ArrayBuffer;
 
 /** A fresh, empty `arguments` object (this module is strict, so it is unmapped). */
 function emptyArguments(): object {
@@ -87,7 +106,7 @@ const mapSet = Reflect.get(Map.prototype, "set") as (this: object, ...args: unkn
 const setAdd = Reflect.get(Set.prototype, "add") as (this: object, ...args: unknown[]) => unknown;
 
 export function snapshot<T>(value: T): T {
-  const seen: Seen = new WeakMap();
+  const seen: Seen = new WeakMapConstructor();
   const pending: Pending = { top: null };
   const root = shell(value, seen, pending);
   for (let link = pending.top; link !== null; link = pending.top) {
@@ -106,7 +125,8 @@ export function snapshot<T>(value: T): T {
  */
 function shell(value: unknown, seen: Seen, pending: Pending): unknown {
   if (typeof value !== "object" || value === null) return value;
-  if (seen.has(value)) return seen.get(value);
+  const known = weakMapGet(seen, value);
+  if (known !== undefined) return known;
 
   const kind = kindOf(value);
   let copy: object;
@@ -114,7 +134,7 @@ function shell(value: unknown, seen: Seen, pending: Pending): unknown {
 
   switch (kind) {
     case "Object":
-      copy = Object.create(Object.getPrototypeOf(value) as object | null) as object;
+      copy = objectCreate(getPrototypeOf(value) as object | null) as object;
       break;
     case "Arguments":
       copy = emptyArguments();
@@ -122,34 +142,34 @@ function shell(value: unknown, seen: Seen, pending: Pending): unknown {
     case "Array": {
       const elements = denseElements(value);
       dense = elements !== undefined;
-      copy = elements ?? new Array<unknown>((value as unknown[]).length);
+      copy = elements ?? new ArrayConstructor<unknown>((value as unknown[]).length);
       break;
     }
     case "Date":
-      copy = new Date(dateValue(value));
+      copy = new DateConstructor(dateValue(value));
       break;
     case "RegExp": {
       const { source, flags, lastIndex } = regExpParts(value);
-      const regexp = new RegExp(source, flags);
-      Object.defineProperty(regexp, "lastIndex", { value: lastIndex });
+      const regexp = new RegExpConstructor(source, flags);
+      defineProperty(regexp, "lastIndex", { value: lastIndex });
       copy = regexp;
       break;
     }
     case "Map":
-      copy = new Map<unknown, unknown>();
+      copy = new MapConstructor<unknown, unknown>();
       break;
     case "Set":
-      copy = new Set<unknown>();
+      copy = new SetConstructor<unknown>();
       break;
     case "ArrayBuffer": {
       const bytes = bufferBytes(value, kind);
-      const buffer = new ArrayBuffer(bytes.length);
-      new Uint8Array(buffer).set(bytes);
+      const buffer = new ArrayBufferConstructor(bytes.length);
+      if (bytes.length > 0) copyTypedArrayInto(new Uint8ArrayConstructor(buffer), bytes);
       copy = buffer;
       break;
     }
     case "TypedArray": {
-      const Typed = typedArrayConstructors.get(typedArrayName(value));
+      const Typed = typedArrayConstructors[typedArrayName(value)];
       if (!Typed) return value; // an element type this runtime cannot construct: keep by reference
       const length = typedArrayLength(value);
       copy = new Typed(length);
@@ -161,9 +181,9 @@ function shell(value: unknown, seen: Seen, pending: Pending): unknown {
   }
 
   registerBrand(copy, kind);
-  seen.set(value, copy);
-  const proto = Object.getPrototypeOf(value) as object | null;
-  if (Object.getPrototypeOf(copy) !== proto) Object.setPrototypeOf(copy, proto);
+  weakMapSet(seen, value, copy);
+  const proto = getPrototypeOf(value) as object | null;
+  if (getPrototypeOf(copy) !== proto) setPrototypeOf(copy, proto);
   pending.top = { task: { from: value, to: copy, kind, dense }, next: pending.top };
   return copy;
 }
@@ -171,11 +191,16 @@ function shell(value: unknown, seen: Seen, pending: Pending): unknown {
 /** Fill in a copy's entries, members, elements and own enumerable properties. */
 function fill({ from, to, kind, dense }: Task, seen: Seen, pending: Pending): void {
   if (kind === "Map") {
-    for (const [key, entry] of mapEntries(from)) {
-      Reflect.apply(mapSet, to, [shell(key, seen, pending), shell(entry, seen, pending)]);
+    const entries = mapEntries(from);
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index] as [unknown, unknown];
+      reflectApply(mapSet, to, [shell(entry[0], seen, pending), shell(entry[1], seen, pending)]);
     }
   } else if (kind === "Set") {
-    for (const member of setValues(from)) Reflect.apply(setAdd, to, [shell(member, seen, pending)]);
+    const members = setValues(from);
+    for (let index = 0; index < members.length; index += 1) {
+      reflectApply(setAdd, to, [shell(members[index], seen, pending)]);
+    }
   }
 
   if (dense) {
@@ -189,9 +214,11 @@ function fill({ from, to, kind, dense }: Task, seen: Seen, pending: Pending): vo
     return;
   }
 
-  for (const key of kind === "TypedArray" ? typedArrayExtraKeys(from) : ownEnumerableKeys(from)) {
-    Object.defineProperty(to, key, {
-      value: shell(Reflect.get(from, key) as unknown, seen, pending),
+  const keys = kind === "TypedArray" ? typedArrayExtraKeys(from) : ownEnumerableKeys(from);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index] as string | symbol;
+    defineProperty(to, key, {
+      value: shell(reflectGet(from, key) as unknown, seen, pending),
       enumerable: true,
       writable: true,
       configurable: true,

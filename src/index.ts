@@ -32,6 +32,18 @@ import { snapshot } from "./snapshot.js";
 export { deepEqual };
 export type { DeepEqualOptions };
 
+// Built-ins the runtime check calls on the way to a verdict, captured once at
+// import (README, Honest limits, "Built-ins and tampering"). The static scanner
+// further down is a text tool and is out of scope for that limit.
+const reflectGet = Reflect.get;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const isArray = Array.isArray;
+// eslint-disable-next-line @typescript-eslint/unbound-method -- saved on purpose, called through call.bind
+const callHasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty) as (
+  object: object,
+  key: PropertyKey,
+) => boolean;
+
 // ---------------------------------------------------------------------------
 // 1. assertPayoutInvariance — runtime invariance under payout mutation.
 // ---------------------------------------------------------------------------
@@ -176,12 +188,12 @@ function describeError(error: unknown): string {
   }
 }
 
-const hasOwn = (object: object, key: PropertyKey): boolean => Object.prototype.hasOwnProperty.call(object, key);
+const hasOwn = (object: object, key: PropertyKey): boolean => callHasOwn(object, key);
 
 /** Only a plain `{}` or `Object.create(null)` object counts as an options or content record. */
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || kindOf(value) !== "Object") return false;
-  const proto = Object.getPrototypeOf(value) as unknown;
+  const proto = objectGetPrototypeOf(value) as unknown;
   return proto === Object.prototype || proto === null;
 }
 
@@ -198,7 +210,7 @@ function isBlank(text: string): boolean {
  * scenario's getters do later.
  */
 function snapshotMutations<TInput>(mutations: unknown): PayoutMutationScenario<TInput>[] {
-  if (!Array.isArray(mutations)) {
+  if (!isArray(mutations)) {
     throw new TypeError("assertPayoutInvariance: mutations must be an array of { name, mutate } objects.");
   }
   const length = mutations.length;
@@ -215,9 +227,9 @@ function snapshotMutations<TInput>(mutations: unknown): PayoutMutationScenario<T
       );
     }
     const candidate: unknown = mutations[index];
-    const name: unknown = typeof candidate === "object" && candidate !== null ? Reflect.get(candidate, "name") : undefined;
+    const name: unknown = typeof candidate === "object" && candidate !== null ? reflectGet(candidate, "name") : undefined;
     const mutate: unknown =
-      typeof candidate === "object" && candidate !== null ? Reflect.get(candidate, "mutate") : undefined;
+      typeof candidate === "object" && candidate !== null ? reflectGet(candidate, "mutate") : undefined;
     if (typeof name !== "string" || typeof mutate !== "function") {
       throw new TypeError(
         `assertPayoutInvariance: mutations[${index}] must be an object with a string "name" and a "mutate" function.`,
@@ -238,13 +250,11 @@ function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook; o
   }
   const isEqual = opts.isEqual;
   const hasChanged = opts.hasChanged;
-  for (const [hook, value] of [
-    ["isEqual", isEqual],
-    ["hasChanged", hasChanged],
-  ] as const) {
-    if (value !== undefined && typeof value !== "function") {
-      throw new TypeError(`assertPayoutInvariance: opts.${hook} must be a function (or omitted).`);
-    }
+  if (isEqual !== undefined && typeof isEqual !== "function") {
+    throw new TypeError("assertPayoutInvariance: opts.isEqual must be a function (or omitted).");
+  }
+  if (hasChanged !== undefined && typeof hasChanged !== "function") {
+    throw new TypeError("assertPayoutInvariance: opts.hasChanged must be a function (or omitted).");
   }
   const orderSensitive = opts.orderSensitive;
   if (orderSensitive !== undefined && typeof orderSensitive !== "boolean") {
@@ -386,7 +396,8 @@ export function assertPayoutInvariance<TInput, TResult>(
   const failures: PayoutInvarianceFailure<TInput, TResult>[] = [];
   const vacuous: string[] = [];
 
-  for (const { name, mutate } of list) {
+  for (let position = 0; position < list.length; position += 1) {
+    const { name, mutate } = list[position] as PayoutMutationScenario<TInput>;
     const label = `scenario ${quote(name)}`;
     let mutatedInput: TInput;
     try {

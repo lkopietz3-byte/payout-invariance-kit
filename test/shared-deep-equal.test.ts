@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { deepEqual } from "../src/index.js";
+import { assertPayoutInvariance, deepEqual } from "../src/index.js";
 import { snapshot } from "../src/snapshot.js";
 
 describe("shared comparison: fast paths, iteration, order option", () => {
@@ -500,3 +500,164 @@ describe("shared comparison: discarding Array.prototype setters", () => {
   });
 });
 
+describe("shared comparison: rewritten built-ins", { timeout: 180_000 }, () => {
+  /** Replace one property of a built-in for the length of `run`, then put it back exactly. */
+  function withTamperedGlobal<T>(target: object, key: PropertyKey, descriptor: PropertyDescriptor, run: () => T): T {
+    const original = Object.getOwnPropertyDescriptor(target, key);
+    Object.defineProperty(target, key, { configurable: true, ...descriptor });
+    try {
+      return run();
+    } finally {
+      if (original) Object.defineProperty(target, key, original);
+      else delete (target as Record<PropertyKey, unknown>)[key];
+    }
+  }
+
+  it("an empty generator at Object.prototype[Symbol.iterator] cannot empty the arrays being compared", () => {
+    const emptyGenerator = function* (): Generator<never> {
+      // yields nothing
+    };
+    const results = withTamperedGlobal(Object.prototype, Symbol.iterator, { value: emptyGenerator, writable: true }, () => [
+      deepEqual([1], [2]),
+      deepEqual({ cause: [1] }, { cause: [2] }),
+      deepEqual(new Error("x", { cause: [1, 2] }), new Error("x", { cause: [1, 3] })),
+      deepEqual(new Set([1]), new Set([2])),
+      deepEqual(new Map([[1, 1]]), new Map([[1, 2]])),
+      deepEqual(new Set([{ a: 1 }]), new Set([{ a: 2 }])),
+      deepEqual(new Map([[{ a: 1 }, 1]]), new Map([[{ a: 1 }, 2]])),
+    ]);
+    expect(results).toEqual([false, false, false, false, false, false, false]);
+    const base = { n: 1, list: [1, 2], set: new Set([{ z: 1 }]) };
+    const run = () =>
+      assertPayoutInvariance((input: typeof base) => ({ list: input.list }), base, [
+        { name: "list differs", mutate: (input) => ({ ...input, list: [1, 3] }) },
+      ]);
+    const outcome = withTamperedGlobal(Object.prototype, Symbol.iterator, { value: emptyGenerator, writable: true }, run);
+    expect(outcome.passed).toBe(false);
+    expect(outcome.failures).toHaveLength(1);
+  });
+
+  it("replacing Object.prototype.propertyIsEnumerable cannot make a sparse array with an extra key look clean", () => {
+    // eslint-disable-next-line no-sparse-arrays
+    const sparse = Object.assign([, 1], { extra: 1 });
+    const dense = [undefined, 1];
+    const results = withTamperedGlobal(
+      Object.prototype,
+      "propertyIsEnumerable",
+      { value: () => true, writable: true },
+      () => [deepEqual(sparse, dense), deepEqual(dense, sparse)],
+    );
+    expect(results).toEqual([false, false]);
+  });
+
+  it("rewriting a built-in the comparison relies on, after import, cannot change a verdict", () => {
+    const noop = () => undefined;
+    const emptyGenerator = function* (): Generator<never> {
+      // yields nothing
+    };
+    // Fixtures are built before any built-in is rewritten: only the comparison runs under the rewrite.
+    const tag = Symbol("tag");
+    const base = { n: 1, list: [{ a: 1 }, { a: 2 }], set: new Set([{ z: 1 }]) };
+    const mutated = { ...base, list: [{ a: 1 }, { a: 3 }] };
+    // eslint-disable-next-line no-sparse-arrays
+    const sparseWithExtra = Object.assign([, 1], { extra: 1 });
+    const fixtures = {
+      s1: new Set([{ a: 1 }, { a: 2 }]),
+      s2: new Set([{ a: 2 }, { a: 1 }]),
+      s3: new Set([{ a: 2 }, { a: 3 }]),
+      m1: new Map([[{ k: 1 }, [1]]]),
+      m2: new Map([[{ k: 1 }, [2]]]),
+      o1: Object.assign({ a: 1 }, { [tag]: 1 }),
+      o2: Object.assign({ a: 1 }, { [tag]: 2 }),
+      e1: new Error("x", { cause: [1] }),
+      e2: new Error("x", { cause: [2] }),
+      u1: new Uint8Array([1, 2]),
+      u2: new Uint8Array([1, 3]),
+      d1: new Date(1),
+      d2: new Date(2),
+      p12: new Set([1, 2]),
+      p21: new Set([2, 1]),
+      a12: [1, 2],
+      a13: [1, 3],
+      a12b: [1, 2],
+      n1: { a: [1] },
+      n2: { a: [2] },
+      dense: [undefined, 1],
+    };
+    const battery = (): unknown[] => {
+      const f = fixtures;
+      const flip = assertPayoutInvariance((input: typeof base) => (input.list[1] as { a: number }).a, base, [
+        { name: "change a", mutate: () => mutated },
+      ]);
+      return [
+        deepEqual(f.a12, f.a13),
+        deepEqual(f.a12, f.a12b),
+        deepEqual(f.n1, f.n2),
+        deepEqual(f.s1, f.s2),
+        deepEqual(f.s1, f.s3),
+        deepEqual(f.m1, f.m2),
+        deepEqual(f.o1, f.o2),
+        deepEqual(f.e1, f.e2),
+        deepEqual(f.u1, f.u2),
+        deepEqual(f.d1, f.d2),
+        deepEqual(1, 2),
+        deepEqual(sparseWithExtra, f.dense),
+        deepEqual(f.p12, f.p21, { orderSensitive: true }),
+        flip.failures.length,
+      ];
+    };
+    const expected = battery();
+    expect(expected).toEqual([false, true, false, true, false, false, false, false, false, false, false, false, false, 1]);
+
+    const tampers: [string, object, PropertyKey, unknown][] = [
+      ["Object.is", Object, "is", () => true],
+      ["Object.keys", Object, "keys", () => []],
+      ["Object.getPrototypeOf", Object, "getPrototypeOf", () => null],
+      ["Object.getOwnPropertyDescriptor", Object, "getOwnPropertyDescriptor", () => undefined],
+      ["Object.create", Object, "create", noop],
+      ["Object.getOwnPropertySymbols", Object, "getOwnPropertySymbols", () => []],
+      ["Object.entries", Object, "entries", () => []],
+      ["Reflect.get", Reflect, "get", () => 1],
+      ["Reflect.apply", Reflect, "apply", noop],
+      ["Array.isArray", Array, "isArray", () => false],
+      ["Array.from", Array, "from", () => []],
+      ["ArrayBuffer.isView", ArrayBuffer, "isView", () => false],
+      ["Object.prototype[Symbol.iterator]", Object.prototype, Symbol.iterator, emptyGenerator],
+      ["Array.prototype[Symbol.iterator]", Array.prototype, Symbol.iterator, emptyGenerator],
+      ["Array.prototype.filter", Array.prototype, "filter", () => []],
+      ["Array.prototype.findIndex", Array.prototype, "findIndex", () => -1],
+      ["Array.prototype.splice", Array.prototype, "splice", () => []],
+      ["Array.prototype.some", Array.prototype, "some", () => false],
+      ["Array.prototype.push", Array.prototype, "push", () => 0],
+      ["Array.prototype.map", Array.prototype, "map", () => []],
+      ["Map.prototype.get", Map.prototype, "get", () => undefined],
+      ["Map.prototype.has", Map.prototype, "has", () => true],
+      ["Map.prototype.set", Map.prototype, "set", noop],
+      ["Set.prototype.has", Set.prototype, "has", () => true],
+      ["Set.prototype.add", Set.prototype, "add", noop],
+      ["WeakMap.prototype.get", WeakMap.prototype, "get", () => undefined],
+      ["WeakMap.prototype.set", WeakMap.prototype, "set", noop],
+      ["WeakSet.prototype.has", WeakSet.prototype, "has", () => true],
+      ["WeakSet.prototype.add", WeakSet.prototype, "add", noop],
+      ["WeakSet.prototype.delete", WeakSet.prototype, "delete", noop],
+      ["RegExp.prototype.test", RegExp.prototype, "test", () => false],
+      ["Function.prototype.call", Function.prototype, "call", noop],
+      ["Function.prototype.bind", Function.prototype, "bind", noop],
+      ["Function.prototype.toString", Function.prototype, "toString", () => ""],
+      ["Object.prototype.propertyIsEnumerable", Object.prototype, "propertyIsEnumerable", () => true],
+      ["Object.prototype.hasOwnProperty", Object.prototype, "hasOwnProperty", () => true],
+      ["Object.prototype.toString", Object.prototype, "toString", () => "[object Object]"],
+    ];
+    const wrong: string[] = [];
+    for (const [label, target, key, replacement] of tampers) {
+      let got: unknown;
+      try {
+        got = withTamperedGlobal(target, key, { value: replacement, writable: true }, battery);
+      } catch (error) {
+        got = `threw ${(error as Error).message.slice(0, 60)}`;
+      }
+      if (JSON.stringify(got) !== JSON.stringify(expected)) wrong.push(`${label}: ${JSON.stringify(got)}`);
+    }
+    expect(wrong).toEqual([]);
+  });
+});

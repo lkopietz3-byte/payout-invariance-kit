@@ -501,6 +501,27 @@ cannot see:
   in JSX text opens a template literal that never closes, and JSX text is not
   tokenized, so a `//` inside it (`<p>see https://example.com/payout</p>`)
   starts a comment that hides the rest of that line.
+- **Built-ins and tampering.** The comparison, the copy and the run loop of
+  `assertPayoutInvariance` do not look built-ins up while they work. What they
+  use (`Object.is`, `Object.keys`, `Object.getPrototypeOf`, `Reflect.get` and
+  `Reflect.apply`, `Array.isArray` and `Array.from`, `Function.prototype.call`
+  and `bind`, the `Map`, `Set`, `WeakMap`, `Date`, `RegExp` and typed array
+  operations used to recognize and read a value, and
+  `Object.prototype.propertyIsEnumerable`, `hasOwnProperty` and `toString`) is
+  saved when the package loads, and what cannot be saved is avoided: no
+  `for...of`, spread, array destructuring or `Array.prototype` method on the
+  way to a verdict. Lists are built as own data properties or as linked
+  stacks, so an iterator, an index accessor or a method put on
+  `Object.prototype` or `Array.prototype` cannot empty, shorten or reorder
+  them. Out of scope: a script that rewrites a built-in before this package is
+  imported, that replaces a global binding (such as `Object` or `Array`
+  themselves), or that rewrites a built-in not listed here; the text helpers
+  that shape error messages; and `assertNoPayoutImports`, which is a text
+  scanner that uses ordinary string, regular expression and array methods. The
+  package is a regression test for code you run in your own process, not a
+  sandbox against code in that process that is trying to fool it. The values
+  you pass in, and your own `rankFn`, `mutate` and hooks, run as written
+  (getters and `Proxy` traps included).
 - A line is a line only up to `\n`, `\r\n` or a lone `\r` when the result
   reports line numbers; U+2028 and U+2029 end a `//` comment but do not start
   a new reported line.

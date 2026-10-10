@@ -84,6 +84,14 @@ so the next release should be a minor version. No version bump here.
     with offenses, and turn a failing run into a pass. Those lists are now built
     with own-property appends, and the comparison and copy work stacks are
     linked lists that never write array indexes.
+  - The comparison, the copy and the `assertPayoutInvariance` run loop no longer
+    look built-ins up while they work. They use copies saved at import and
+    avoid `for...of`, spread and `Array.prototype` methods, so an empty
+    iterator on `Object.prototype`, a replaced `propertyIsEnumerable` or a
+    rewritten `Object.keys`, `Array.from`, `Map.prototype.get` and similar
+    cannot empty a list, make a sparse array look clean, or turn a failing run
+    into a pass. The README limit "Built-ins and tampering" states what is and
+    is not covered (`assertNoPayoutImports` is not).
   - The copy fills Maps and Sets with the real `Map.prototype.set` and
     `Set.prototype.add`, never the input's own overrides, and very wide inputs
     (150,000 elements or named keys) no longer hit the argument limit.

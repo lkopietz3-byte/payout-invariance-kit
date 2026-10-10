@@ -45,13 +45,32 @@ type AnyFunction = (this: unknown, ...args: never[]) => unknown;
 
 const reflectApply = Reflect.apply;
 
-const uncurry =
-  (fn: AnyFunction): Intrinsic =>
-  (receiver, ...args) =>
-    reflectApply(fn, receiver, args) as unknown;
+// Static built-ins this file calls while comparing, captured once at import
+// so a script that later replaces `Object.is` (and so on) cannot change a verdict.
+const objectIs = Object.is;
+const getPrototypeOf = Object.getPrototypeOf;
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const defineProperty = Object.defineProperty;
+const objectCreate = Object.create;
+const reflectGet = Reflect.get;
+const isArray = Array.isArray;
+const isView = Reflect.get(ArrayBuffer, "isView") as (value: unknown) => value is ArrayBufferView;
+const ArrayConstructor = Array;
+const Uint8ArrayConstructor = Uint8Array;
+const WeakMapConstructor = WeakMap;
+const WeakSetConstructor = WeakSet;
+const objectPrototype = Object.prototype;
+const rangeErrorPrototype: object = RangeError.prototype;
+
+// `uncurry(f)(receiver, ...args)` is `f.call(receiver, ...args)` through the
+// `Function.prototype.call` captured here, so neither `f.call` nor the
+// receiver's own methods are looked up at call time.
+const functionCall = Reflect.get(Function.prototype, "call") as (this: AnyFunction, ...args: unknown[]) => unknown;
+const functionBind = Reflect.get(Function.prototype, "bind") as (this: AnyFunction, ...args: unknown[]) => unknown;
+const uncurry = (fn: AnyFunction): Intrinsic => reflectApply(functionBind, functionCall, [fn]) as Intrinsic;
 
 function ownDescriptor(object: object | undefined, key: PropertyKey): { get?: unknown; value?: unknown } | undefined {
-  return object === undefined ? undefined : Object.getOwnPropertyDescriptor(object, key);
+  return object === undefined ? undefined : getOwnPropertyDescriptor(object, key);
 }
 
 function getterOf(proto: object | undefined, key: PropertyKey): Intrinsic | undefined {
@@ -65,11 +84,11 @@ function methodOf(proto: object | undefined, key: PropertyKey): Intrinsic | unde
 }
 
 function protoOf(name: string): object | undefined {
-  const ctor: unknown = Reflect.get(globalThis, name);
+  const ctor: unknown = reflectGet(globalThis, name);
   return typeof ctor === "function" ? (ctor.prototype as object) : undefined;
 }
 
-const TypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const TypedArrayPrototype = getPrototypeOf(Uint8Array.prototype) as object;
 const ErrorPrototype = Error.prototype as object;
 const RegExpPrototype = RegExp.prototype as object;
 const SharedArrayBufferPrototype = protoOf("SharedArrayBuffer");
@@ -85,12 +104,12 @@ const dataViewByteOffset = getterOf(DataView.prototype, "byteOffset") as Intrins
 const dataViewByteLength = getterOf(DataView.prototype, "byteLength") as Intrinsic;
 const mapSize = getterOf(Map.prototype, "size") as Intrinsic;
 const mapEntriesOf = methodOf(Map.prototype, "entries") as Intrinsic;
-const mapIteratorNext = methodOf(Object.getPrototypeOf(new Map().entries()) as object, "next") as Intrinsic;
+const mapIteratorNext = methodOf(getPrototypeOf(new Map().entries()) as object, "next") as Intrinsic;
 const mapHas = methodOf(Map.prototype, "has") as Intrinsic;
 const mapGet = methodOf(Map.prototype, "get") as Intrinsic;
 const setSize = getterOf(Set.prototype, "size") as Intrinsic;
 const setValuesOf = methodOf(Set.prototype, "values") as Intrinsic;
-const setIteratorNext = methodOf(Object.getPrototypeOf(new Set().values()) as object, "next") as Intrinsic;
+const setIteratorNext = methodOf(getPrototypeOf(new Set().values()) as object, "next") as Intrinsic;
 const setHas = methodOf(Set.prototype, "has") as Intrinsic;
 const weakMapHas = methodOf(WeakMap.prototype, "has") as Intrinsic;
 const weakSetHas = methodOf(WeakSet.prototype, "has") as Intrinsic;
@@ -123,8 +142,12 @@ const hasOwnProperty = methodOf(Object.prototype, "hasOwnProperty") as Intrinsic
 const objectKeys = Object.keys;
 const arrayFrom = Array.from as AnyFunction;
 const objectSymbols = Object.getOwnPropertySymbols;
-const hasEnumerableIndex = (array: object, index: number): boolean =>
-  Object.prototype.propertyIsEnumerable.call(array, index);
+/** Internal. Captured `WeakMap.prototype` operations, shared with snapshot.ts. */
+export const weakMapGet = methodOf(WeakMap.prototype, "get") as Intrinsic;
+export const weakMapSet = methodOf(WeakMap.prototype, "set") as Intrinsic;
+const weakSetAdd = methodOf(WeakSet.prototype, "add") as Intrinsic;
+const weakSetDelete = methodOf(WeakSet.prototype, "delete") as Intrinsic;
+
 
 /** Internal. Every typed array type a runtime may have, by constructor name. */
 export const TYPED_ARRAY_NAMES = [
@@ -185,7 +208,44 @@ slotPrototypes.add(TypedArrayPrototype);
 const slotBuiltinNames = new Set<string>([...SLOT_BUILTINS, ...TYPED_ARRAY_NAMES, "TypedArray"]);
 
 const functionToString = methodOf(Function.prototype, "toString") as Intrinsic;
-const NATIVE_CODE = /\{\s*\[native code\]\s*\}\s*$/;
+
+const WHITESPACE = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
+
+/** Index `end` moved back past any whitespace (the regular expression `\s`), read by string index only. */
+function skipSpaceBackwards(text: string, end: number): number {
+  let position = end;
+  while (position > 0) {
+    const character = text[position - 1] as string;
+    let space = false;
+    for (let index = 0; index < WHITESPACE.length; index += 1) {
+      if (character === WHITESPACE[index]) {
+        space = true;
+        break;
+      }
+    }
+    if (!space) break;
+    position -= 1;
+  }
+  return position;
+}
+
+/**
+ * True if `source` ends with `{ [native code] }` (whitespace allowed inside
+ * and after), the shape of a built-in function's source. Written by hand,
+ * not as a regular expression, so no `RegExp.prototype` method is called.
+ */
+function endsWithNativeCode(source: string): boolean {
+  const marker = "[native code]";
+  let end = skipSpaceBackwards(source, source.length);
+  if (source[end - 1] !== "}") return false;
+  end = skipSpaceBackwards(source, end - 1);
+  if (end < marker.length) return false;
+  for (let index = 0; index < marker.length; index += 1) {
+    if (source[end - marker.length + index] !== marker[index]) return false;
+  }
+  end = skipSpaceBackwards(source, end - marker.length);
+  return source[end - 1] === "{";
+}
 
 /**
  * "Error" or "Slot" if `fn` is a built-in constructor from any realm: a
@@ -196,9 +256,9 @@ const NATIVE_CODE = /\{\s*\[native code\]\s*\}\s*$/;
 function builtinConstructorKind(fn: unknown): "Error" | "Slot" | undefined {
   if (typeof fn !== "function") return undefined;
   const name = ownDescriptor(fn, "name")?.value;
-  if (typeof name !== "string" || (name !== "Error" && !slotBuiltinNames.has(name))) return undefined;
+  if (typeof name !== "string" || (name !== "Error" && setHas(slotBuiltinNames, name) !== true)) return undefined;
   const source = functionToString(fn);
-  if (typeof source !== "string" || !NATIVE_CODE.test(source)) return undefined;
+  if (typeof source !== "string" || !endsWithNativeCode(source)) return undefined;
   return name === "Error" ? "Error" : "Slot";
 }
 
@@ -229,14 +289,14 @@ type Brand = "Map" | "Set" | "ArrayBuffer" | "SharedArrayBuffer" | "Date" | "Reg
  * A value's internal slots never change, so its brand is cached. Copies made
  * by `snapshot` are registered here as they are created.
  */
-const brandCache = new WeakMap<object, Brand>();
+const brandCache = new WeakMapConstructor<object, Brand>();
 
 /** Kinds whose brand comes from an internal slot (the rest have brand "None"). */
 const slotBrands = new Set<Kind>(["Map", "Set", "ArrayBuffer", "SharedArrayBuffer", "Date", "RegExp", "Boxed"]);
 
 /** Internal. Record the brand of a value this package just created. */
 export function registerBrand(value: object, kind: Kind): void {
-  brandCache.set(value, slotBrands.has(kind) ? (kind as Brand) : "None");
+  weakMapSet(brandCache, value, setHas(slotBrands, kind) === true ? kind : "None");
 }
 
 /**
@@ -244,6 +304,13 @@ export function registerBrand(value: object, kind: Kind): void {
  * cost. None of these intrinsics can run caller code, so stack traces are
  * switched off only for the duration of the probe (where the engine allows).
  */
+function passesAnyBoxed(value: object): boolean {
+  for (let index = 0; index < boxedValueOf.length; index += 1) {
+    if (passes(boxedValueOf[index], value)) return true;
+  }
+  return false;
+}
+
 function probeBrand(value: object): Brand {
   const errorConstructor = Error as { stackTraceLimit?: unknown };
   const saved = errorConstructor.stackTraceLimit;
@@ -264,7 +331,7 @@ function probeBrand(value: object): Brand {
     if (passes(dateGetTime, value)) return "Date";
     // RegExp.prototype itself answers `source` without being a RegExp.
     if (value !== RegExpPrototype && passes(regExpSource, value)) return "RegExp";
-    if (boxedValueOf.some((valueOf) => passes(valueOf, value))) return "Boxed";
+    if (passesAnyBoxed(value)) return "Boxed";
     // Unregistering a token that was never registered changes nothing.
     if (
       passes(weakMapHas, value, {}) ||
@@ -281,10 +348,10 @@ function probeBrand(value: object): Brand {
 }
 
 function brandOf(value: object): Brand {
-  let brand = brandCache.get(value);
+  let brand = weakMapGet(brandCache, value) as Brand | undefined;
   if (brand === undefined) {
     brand = probeBrand(value);
-    brandCache.set(value, brand);
+    weakMapSet(brandCache, value, brand);
   }
   return brand;
 }
@@ -303,12 +370,12 @@ function classifyByChain(value: object): "Error" | "Opaque" | undefined {
   let isError = false;
   let notComparable = false;
   let depth = 0;
-  for (let object: object | null = value; object !== null; object = Object.getPrototypeOf(object) as object | null) {
+  for (let object: object | null = value; object !== null; object = getPrototypeOf(object) as object | null) {
     depth += 1;
     if (depth > MAX_PROTOTYPE_CHAIN) return "Opaque";
     if (object === ErrorPrototype) isError = true;
-    if (slotPrototypes.has(object)) notComparable = true;
-    const tag = Object.getOwnPropertyDescriptor(object, Symbol.toStringTag);
+    if (setHas(slotPrototypes, object) === true) notComparable = true;
+    const tag = getOwnPropertyDescriptor(object, Symbol.toStringTag);
     if (tag !== undefined && (typeof tag.value === "string" || tag.get !== undefined || tag.set !== undefined)) {
       notComparable = true;
     }
@@ -327,14 +394,14 @@ function classifyByChain(value: object): "Error" | "Opaque" | undefined {
  * is compared like any other key.
  */
 function constructorClaimsBuiltin(value: object): boolean {
-  if (Object.getOwnPropertyDescriptor(value, "constructor") !== undefined) return false;
+  if (getOwnPropertyDescriptor(value, "constructor") !== undefined) return false;
   return builtinConstructorKind(read(value, "constructor")) !== undefined;
 }
 
 function classify(value: object): Kind {
-  if (Array.isArray(value)) return "Array";
+  if (isArray(value)) return "Array";
   // The only views are typed arrays and DataViews.
-  if (ArrayBuffer.isView(value)) return typeof typedArrayTag(value) === "string" ? "TypedArray" : "DataView";
+  if (isView(value)) return typeof typedArrayTag(value) === "string" ? "TypedArray" : "DataView";
   const brand = brandOf(value);
   if (brand !== "None") return brand;
   const byChain = classifyByChain(value);
@@ -358,6 +425,22 @@ function classify(value: object): Kind {
 }
 
 /**
+ * Internal. True for a `RangeError` of this realm (a stack overflow is one),
+ * decided from the prototype chain, not `instanceof`.
+ */
+export function isRangeError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  try {
+    for (let proto = getPrototypeOf(error) as object | null; proto !== null; proto = getPrototypeOf(proto) as object | null) {
+      if (proto === rangeErrorPrototype) return true;
+    }
+  } catch {
+    // a Proxy that throws is not something we can classify
+  }
+  return false;
+}
+
+/**
  * Internal. Classify an object (see `Kind`). A value that cannot even be
  * classified (a revoked Proxy, a Proxy trap that throws) is "Opaque".
  */
@@ -367,7 +450,7 @@ export function kindOf(value: object): Kind {
   } catch (error) {
     // A stack overflow is not a property of the value: let it surface rather
     // than turn a deeply nested (or deeply called) comparison into "different".
-    if (error instanceof RangeError) throw error;
+    if (isRangeError(error)) throw error;
     return "Opaque";
   }
 }
@@ -400,19 +483,22 @@ export function dateValue(value: object): number {
 /** Internal. A RegExp's source, flags (canonical order) and lastIndex. */
 export function regExpParts(value: object): { source: string; flags: string; lastIndex: unknown } {
   let flags = "";
-  for (const [get, flag] of regExpFlagGetters) if (get(value) === true) flags += flag;
+  for (let index = 0; index < regExpFlagGetters.length; index += 1) {
+    const entry = regExpFlagGetters[index] as readonly [Intrinsic, string];
+    if (entry[0](value) === true) flags += entry[1];
+  }
   return {
     source: regExpSource(value) as string,
     flags,
-    lastIndex: Object.getOwnPropertyDescriptor(value, "lastIndex")?.value,
+    lastIndex: getOwnPropertyDescriptor(value, "lastIndex")?.value,
   };
 }
 
 /** Internal. A boxed primitive's own value. */
 function boxedValue(value: object): unknown {
-  for (const valueOf of boxedValueOf) {
+  for (let index = 0; index < boxedValueOf.length; index += 1) {
     try {
-      return valueOf(value);
+      return (boxedValueOf[index] as Intrinsic)(value);
     } catch {
       // not this wrapper type
     }
@@ -428,12 +514,23 @@ function boxedValue(value: object): unknown {
  * is built with this, with `ownArray`, or without arrays at all.
  */
 export function appendOwn<T>(array: T[], value: T): void {
-  Object.defineProperty(array, array.length, { value, writable: true, enumerable: true, configurable: true });
+  defineProperty(array, array.length, { value, writable: true, enumerable: true, configurable: true });
 }
 
 /** An array of `length` own `undefined` elements; assigning to one later cannot reach an inherited setter. */
 function ownArray(length: number): unknown[] {
-  return reflectApply(arrayFrom, Array, [{ length }]) as unknown[];
+  return reflectApply(arrayFrom, ArrayConstructor, [arrayLike(length)]) as unknown[];
+}
+
+/**
+ * `{ length }` with no prototype. A plain `{ length }` inherits from
+ * `Object.prototype`, so a script that put an iterator there would make
+ * `Array.from` iterate it (and yield nothing) instead of reading `length`.
+ */
+function arrayLike(length: number): { length: number } {
+  const object = objectCreate(null) as { length: number };
+  object.length = length;
+  return object;
 }
 
 function drain(iterator: unknown, next: Intrinsic, size: number): unknown[] {
@@ -465,7 +562,7 @@ export function bufferBytes(value: object, kind: "ArrayBuffer" | "SharedArrayBuf
   const byteLength = (kind === "ArrayBuffer" ? arrayBufferByteLength : (sharedArrayBufferByteLength as Intrinsic))(
     value,
   ) as number;
-  return byteLength === 0 ? new Uint8Array(0) : new Uint8Array(value as ArrayBufferLike, 0, byteLength);
+  return byteLength === 0 ? new Uint8ArrayConstructor(0) : new Uint8ArrayConstructor(value as ArrayBufferLike, 0, byteLength);
 }
 
 /** The bytes a DataView can see, or undefined when they cannot be read (detached or out of bounds). */
@@ -473,7 +570,7 @@ function dataViewBytes(value: object): Uint8Array | undefined {
   try {
     const byteLength = dataViewByteLength(value) as number;
     const byteOffset = dataViewByteOffset(value) as number;
-    return new Uint8Array(dataViewBuffer(value) as ArrayBufferLike, byteOffset, byteLength);
+    return new Uint8ArrayConstructor(dataViewBuffer(value) as ArrayBufferLike, byteOffset, byteLength);
   } catch {
     return undefined;
   }
@@ -482,7 +579,9 @@ function dataViewBytes(value: object): Uint8Array | undefined {
 /** Internal. Own enumerable string keys, then own enumerable symbols. */
 export function ownEnumerableKeys(value: object): (string | symbol)[] {
   const keys: (string | symbol)[] = objectKeys(value);
-  for (const symbol of objectSymbols(value)) {
+  const symbols = objectSymbols(value);
+  for (let index = 0; index < symbols.length; index += 1) {
+    const symbol = symbols[index] as symbol;
     if (propertyIsEnumerable(value, symbol) === true) appendOwn(keys, symbol);
   }
   return keys;
@@ -490,8 +589,9 @@ export function ownEnumerableKeys(value: object): (string | symbol)[] {
 
 /** True if `value` has an own enumerable symbol key. */
 function hasEnumerableSymbol(value: object): boolean {
-  for (const symbol of objectSymbols(value)) {
-    if (propertyIsEnumerable(value, symbol) === true) return true;
+  const symbols = objectSymbols(value);
+  for (let index = 0; index < symbols.length; index += 1) {
+    if (propertyIsEnumerable(value, symbols[index]) === true) return true;
   }
   return false;
 }
@@ -517,21 +617,24 @@ export function denseElements(array: object): unknown[] | undefined {
   if (keys.length !== length) return undefined;
   let inOrder = true;
   for (let index = 0; index < length; index += 1) {
-    if (keys[index] !== String(index)) {
+    if (keys[index] !== `${index}`) {
       inOrder = false;
       break;
     }
   }
   if (!inOrder) {
     for (let index = 0; index < length; index += 1) {
-      if (!hasEnumerableIndex(array, index)) return undefined;
+      if (propertyIsEnumerable(array, index) !== true) return undefined;
     }
   }
   if (hasEnumerableSymbol(array)) return undefined;
   // Array.from creates own data properties, so an accessor an outside script
   // put on Array.prototype (a setter that discards writes) cannot swallow an
   // element the way plain assignment into a fresh array would.
-  return reflectApply(arrayFrom, Array, [{ length }, (_: unknown, index: number) => (array as unknown[])[index]]) as unknown[];
+  return reflectApply(arrayFrom, ArrayConstructor, [
+    arrayLike(length),
+    (_: unknown, index: number) => (array as unknown[])[index],
+  ]) as unknown[];
 }
 
 /**
@@ -545,14 +648,16 @@ export function typedArrayExtraKeys(value: object): (string | symbol)[] {
   const keys = objectKeys(value);
   const extras: (string | symbol)[] = [];
   for (let index = typedArrayLength(value); index < keys.length; index += 1) appendOwn(extras, keys[index] as string);
-  for (const symbol of objectSymbols(value)) {
+  const symbols = objectSymbols(value);
+  for (let index = 0; index < symbols.length; index += 1) {
+    const symbol = symbols[index] as symbol;
     if (propertyIsEnumerable(value, symbol) === true) appendOwn(extras, symbol);
   }
   return extras;
 }
 
 function read(value: object, key: PropertyKey): unknown {
-  return Reflect.get(value, key) as unknown;
+  return reflectGet(value, key) as unknown;
 }
 
 /** True for values a Map/Set looks up by identity: primitives and functions. */
@@ -656,7 +761,7 @@ export interface DeepEqualOptions {
  * answer is the same as the key-by-key comparison.
  */
 export function deepEqual(a: unknown, b: unknown, options?: DeepEqualOptions): boolean {
-  return run({ top: pair(a, b, null) }, { ordered: readOrderSensitive(options), visited: new WeakMap(), journal: null });
+  return run({ top: pair(a, b, null) }, { ordered: readOrderSensitive(options), visited: new WeakMapConstructor(), journal: null });
 }
 
 /** Read `options` once: undefined or a plain object whose `orderSensitive` is a boolean or undefined. */
@@ -665,11 +770,11 @@ export function readOrderSensitive(options: unknown): boolean {
   if (typeof options !== "object" || options === null || kindOf(options) !== "Object") {
     throw new TypeError("deepEqual: options must be a plain object (or omitted).");
   }
-  const proto = Object.getPrototypeOf(options) as unknown;
-  if (proto !== Object.prototype && proto !== null) {
+  const proto = getPrototypeOf(options) as unknown;
+  if (proto !== objectPrototype && proto !== null) {
     throw new TypeError("deepEqual: options must be a plain object (or omitted).");
   }
-  const value: unknown = Reflect.get(options, "orderSensitive");
+  const value: unknown = reflectGet(options, "orderSensitive");
   if (value !== undefined && typeof value !== "boolean") {
     throw new TypeError("deepEqual: options.orderSensitive must be a boolean (or omitted).");
   }
@@ -747,14 +852,17 @@ function trial(pairs: Link, ctx: Context): boolean {
       outer.tail = mine.tail;
     }
   } else {
-    for (let entry = mine.head; entry !== null; entry = entry.next) ctx.visited.get(entry.a)?.delete(entry.b);
+    for (let entry = mine.head; entry !== null; entry = entry.next) {
+      const partners = weakMapGet(ctx.visited, entry.a) as WeakSet<object> | undefined;
+      if (partners !== undefined) weakSetDelete(partners, entry.b);
+    }
   }
   return equal;
 }
 
 /** Queue a pair for comparison. False means the pair is already known to differ. */
 function queue(work: Work, x: unknown, y: unknown): boolean {
-  if (Object.is(x, y)) return true;
+  if (objectIs(x, y)) return true;
   if (typeof x !== "object" || typeof y !== "object" || x === null || y === null) return false;
   work.top = pair(x, y, work.top);
   return true;
@@ -762,14 +870,14 @@ function queue(work: Work, x: unknown, y: unknown): boolean {
 
 /** True the first time a pair is reached. */
 function firstVisit(a: object, b: object, ctx: Context): boolean {
-  let partners = ctx.visited.get(a);
+  let partners = weakMapGet(ctx.visited, a) as WeakSet<object> | undefined;
   if (partners === undefined) {
-    partners = new WeakSet();
-    ctx.visited.set(a, partners);
-  } else if (partners.has(b)) {
+    partners = new WeakSetConstructor();
+    weakMapSet(ctx.visited, a, partners);
+  } else if (weakSetHas(partners, b) === true) {
     return false;
   }
-  partners.add(b);
+  weakSetAdd(partners, b);
   const journal = ctx.journal;
   if (journal !== null) {
     const entry: Reached = { a, b, next: null };
@@ -781,11 +889,11 @@ function firstVisit(a: object, b: object, ctx: Context): boolean {
 }
 
 function step(a: unknown, b: unknown, work: Work, ctx: Context): boolean {
-  if (Object.is(a, b)) return true;
+  if (objectIs(a, b)) return true;
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
   const kind = kindOf(a);
   if (kind === "Opaque" || kind !== kindOf(b)) return false;
-  if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+  if (getPrototypeOf(a) !== getPrototypeOf(b)) return false;
   // Cycle guard (see Context.visited).
   if (!firstVisit(a, b, ctx)) return true;
   if (kind === "Array") return arraysEqual(a, b, work, ctx);
@@ -804,18 +912,18 @@ function equalContents(
     case "Arguments":
       return true;
     case "Date":
-      return Object.is(dateValue(a), dateValue(b));
+      return objectIs(dateValue(a), dateValue(b));
     case "RegExp": {
       const ra = regExpParts(a);
       const rb = regExpParts(b);
-      return ra.source === rb.source && ra.flags === rb.flags && Object.is(ra.lastIndex, rb.lastIndex);
+      return ra.source === rb.source && ra.flags === rb.flags && objectIs(ra.lastIndex, rb.lastIndex);
     }
     case "Boxed":
-      return Object.is(boxedValue(a), boxedValue(b));
+      return objectIs(boxedValue(a), boxedValue(b));
     case "Error":
       return (
-        Object.is(read(a, "name"), read(b, "name")) &&
-        Object.is(read(a, "message"), read(b, "message")) &&
+        objectIs(read(a, "name"), read(b, "name")) &&
+        objectIs(read(a, "message"), read(b, "message")) &&
         sameOptionalOwn(a, b, "cause", work) &&
         sameOptionalOwn(a, b, "errors", work)
       );
@@ -863,7 +971,8 @@ function sameOwnProperties(a: object, b: object, typed: boolean, work: Work, ctx
       if (keysA[index] !== keysB[index]) return false;
     }
   }
-  for (const key of keysA) {
+  for (let index = 0; index < keysA.length; index += 1) {
+    const key = keysA[index] as string | symbol;
     if (propertyIsEnumerable(b, key) !== true) return false;
     if (!queue(work, read(a, key), read(b, key))) return false;
   }
@@ -890,7 +999,7 @@ function elementsEqual(a: object, b: object): boolean {
   const itemsA = a as ArrayLike<unknown>;
   const itemsB = b as ArrayLike<unknown>;
   for (let i = 0; i < length; i += 1) {
-    if (!Object.is(itemsA[i], itemsB[i])) return false;
+    if (!objectIs(itemsA[i], itemsB[i])) return false;
   }
   return true;
 }
@@ -908,21 +1017,37 @@ function mapsEqual(a: object, b: object, work: Work, ctx: Context): boolean {
     }
     return true;
   }
+  const entriesA = mapEntries(a);
   const objectKeyedA: [unknown, unknown][] = [];
-  for (const [key, value] of mapEntries(a)) {
+  for (let index = 0; index < entriesA.length; index += 1) {
+    const [key, value] = entriesA[index] as [unknown, unknown];
     if (isIdentityKey(key)) {
       if (mapHas(b, key) !== true || !queue(work, value, mapGet(b, key))) return false;
     } else {
       appendOwn(objectKeyedA, [key, value]);
     }
   }
-  const objectKeyedB = mapEntries(b).filter(([key]) => !isIdentityKey(key));
+  const entriesB = mapEntries(b);
+  const objectKeyedB: ([unknown, unknown] | undefined)[] = [];
+  for (let index = 0; index < entriesB.length; index += 1) {
+    const entry = entriesB[index] as [unknown, unknown];
+    if (!isIdentityKey(entry[0])) appendOwn(objectKeyedB, entry);
+  }
   if (objectKeyedA.length !== objectKeyedB.length) return false;
   // deepEqual is an equivalence relation, so greedy one-to-one matching is exact.
-  for (const [keyA, valueA] of objectKeyedA) {
-    const index = objectKeyedB.findIndex(([keyB, valueB]) => trial(pair(keyA, keyB, pair(valueA, valueB, null)), ctx));
-    if (index === -1) return false;
-    objectKeyedB.splice(index, 1);
+  for (let indexA = 0; indexA < objectKeyedA.length; indexA += 1) {
+    const [keyA, valueA] = objectKeyedA[indexA] as [unknown, unknown];
+    let matched = false;
+    for (let indexB = 0; indexB < objectKeyedB.length; indexB += 1) {
+      const candidate = objectKeyedB[indexB];
+      if (candidate === undefined) continue;
+      if (trial(pair(keyA, candidate[0], pair(valueA, candidate[1], null)), ctx)) {
+        objectKeyedB[indexB] = undefined;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) return false;
   }
   return true;
 }
@@ -938,20 +1063,36 @@ function setsEqual(a: object, b: object, work: Work, ctx: Context): boolean {
     }
     return true;
   }
+  const membersA = setValues(a);
   const objectsA: unknown[] = [];
-  for (const member of setValues(a)) {
+  for (let index = 0; index < membersA.length; index += 1) {
+    const member = membersA[index];
     if (isIdentityKey(member)) {
       if (setHas(b, member) !== true) return false;
     } else {
       appendOwn(objectsA, member);
     }
   }
-  const objectsB = setValues(b).filter((member) => !isIdentityKey(member));
+  const membersB = setValues(b);
+  const objectsB: ({ member: unknown } | undefined)[] = [];
+  for (let index = 0; index < membersB.length; index += 1) {
+    const member = membersB[index];
+    if (!isIdentityKey(member)) appendOwn(objectsB, { member });
+  }
   if (objectsA.length !== objectsB.length) return false;
-  for (const member of objectsA) {
-    const index = objectsB.findIndex((other) => trial(pair(member, other, null), ctx));
-    if (index === -1) return false;
-    objectsB.splice(index, 1);
+  for (let indexA = 0; indexA < objectsA.length; indexA += 1) {
+    const member = objectsA[indexA];
+    let matched = false;
+    for (let indexB = 0; indexB < objectsB.length; indexB += 1) {
+      const candidate = objectsB[indexB];
+      if (candidate === undefined) continue;
+      if (trial(pair(member, candidate.member, null), ctx)) {
+        objectsB[indexB] = undefined;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) return false;
   }
   return true;
 }
