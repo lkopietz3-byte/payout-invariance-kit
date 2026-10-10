@@ -31,7 +31,16 @@ async function assertAsyncRankingInvariance<TInput>(
   mutations: PayoutMutationScenario<TInput>[],
 ): Promise<PayoutInvarianceResult<TInput, string[]>> {
   // A copy taken before any call, to catch a ranker that edits baseInput.
+  // structuredClone turns a class instance into a plain object, so a copy
+  // that differs from the original means the input is not plain data and the
+  // in-place check at the end could not be trusted.
   const pristine = structuredClone(baseInput);
+  if (!deepEqual(pristine, baseInput)) {
+    throw new TypeError(
+      "baseInput must be plain data (objects, arrays, strings, numbers, booleans, null). Class instances and " +
+        "Maps with object keys are not supported by this recipe; project the input to plain data first.",
+    );
+  }
 
   // Synchronous pass: assertPayoutInvariance validates the scenarios, runs
   // each mutate once, rejects in-place edits and Promises from mutate, and
@@ -184,6 +193,23 @@ describe("checking an async ranking function", () => {
     const result = await assertAsyncRankingInvariance(counted, baseInput(), [noOp]);
     expect(result).toEqual({ passed: false, baseline: ["a", "b"], failures: [], vacuous: ["changes nothing"] });
     expect(rankCalls).toBe(1);
+  });
+
+  it("class-instance input gets the clear plain-data error, not a bogus in-place-edit error", async () => {
+    class Entry {
+      constructor(
+        public id: string,
+        public qualityScore: number,
+      ) {}
+    }
+    const input = { entries: [new Entry("a", 90), new Entry("b", 40)] };
+    type EntryInput = typeof input;
+    const rank = async (i: EntryInput): Promise<string[]> => i.entries.map((e) => e.id);
+    const bump: PayoutMutationScenario<EntryInput> = {
+      name: "b gets a new score",
+      mutate: (i) => ({ entries: i.entries.map((e) => new Entry(e.id, e.qualityScore + 1)) }),
+    };
+    await expect(assertAsyncRankingInvariance(rank, input, [bump])).rejects.toThrow(/plain data/);
   });
 
   it("README.md shows exactly this recipe", () => {

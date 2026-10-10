@@ -16,6 +16,24 @@
 
 type PairMemo = WeakMap<object, WeakSet<object>>;
 
+/** Internal. The pair memo plus whether iteration and key order are significant. */
+interface Ctx {
+  memo: PairMemo;
+  ordered: boolean;
+}
+
+/** Options for `deepEqual`. Pass a plain object. */
+export interface DeepEqualOptions {
+  /**
+   * When true, the order of a `Map`'s entries, a `Set`'s members and an
+   * object's own enumerable keys is significant, so `new Set(["a", "b"])`
+   * does not equal `new Set(["b", "a"])` and `{ a: 1, b: 2 }` does not equal
+   * `{ b: 2, a: 1 }`. Defaults to false (order is ignored for those three).
+   * Array order always matters. Must be a boolean when given.
+   */
+  orderSensitive?: boolean;
+}
+
 /**
  * Internal. How an object is compared and copied. `Opaque` means "not
  * comparable": its state cannot be read, so it is equal only to itself.
@@ -506,6 +524,11 @@ function isIdentityKey(value: unknown): boolean {
  *   `new Set([{a:1},{a:2}])`. That matching is quadratic in the number of
  *   object members.
  * - Circular references are handled.
+ * - By default the order of a `Map`'s entries, a `Set`'s members and an
+ *   object's own keys is ignored, so a ranker that returns one of those in
+ *   rank order is not distinguished from the same members in another order.
+ *   Pass `{ orderSensitive: true }` to make that order significant (array
+ *   order always is).
  *
  * Not comparable, so equal only to themselves (by reference): functions,
  * `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`, `Promise`, a
@@ -543,11 +566,28 @@ function isIdentityKey(value: unknown): boolean {
  * it makes the value not comparable). Each object's brand is checked once
  * and cached.
  */
-export function deepEqual(a: unknown, b: unknown): boolean {
-  return equal(a, b, new WeakMap());
+export function deepEqual(a: unknown, b: unknown, options?: DeepEqualOptions): boolean {
+  return equal(a, b, { memo: new WeakMap(), ordered: readOrderSensitive(options) });
 }
 
-function equal(a: unknown, b: unknown, memo: PairMemo): boolean {
+/** Read `options` once: undefined or a plain object whose `orderSensitive` is a boolean or undefined. */
+export function readOrderSensitive(options: unknown): boolean {
+  if (options === undefined) return false;
+  if (typeof options !== "object" || options === null || kindOf(options) !== "Object") {
+    throw new TypeError("deepEqual: options must be a plain object (or omitted).");
+  }
+  const proto = Object.getPrototypeOf(options) as unknown;
+  if (proto !== Object.prototype && proto !== null) {
+    throw new TypeError("deepEqual: options must be a plain object (or omitted).");
+  }
+  const value: unknown = Reflect.get(options, "orderSensitive");
+  if (value !== undefined && typeof value !== "boolean") {
+    throw new TypeError("deepEqual: options.orderSensitive must be a boolean (or omitted).");
+  }
+  return value === true;
+}
+
+function equal(a: unknown, b: unknown, ctx: Ctx): boolean {
   if (Object.is(a, b)) return true;
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
   const kind = kindOf(a);
@@ -556,21 +596,21 @@ function equal(a: unknown, b: unknown, memo: PairMemo): boolean {
 
   // Cycle guard: a pair already being compared higher up the stack is assumed
   // equal; any real difference is found on the way back out.
-  let partners = memo.get(a);
+  let partners = ctx.memo.get(a);
   if (partners?.has(b)) return true;
   if (!partners) {
     partners = new WeakSet();
-    memo.set(a, partners);
+    ctx.memo.set(a, partners);
   }
   partners.add(b);
   try {
-    return equalContents(a, b, kind, memo) && sameOwnProperties(a, b, kind === "TypedArray", memo);
+    return equalContents(a, b, kind, ctx) && sameOwnProperties(a, b, kind === "TypedArray", ctx);
   } finally {
     partners.delete(b);
   }
 }
 
-function equalContents(a: object, b: object, kind: Exclude<Kind, "Opaque">, memo: PairMemo): boolean {
+function equalContents(a: object, b: object, kind: Exclude<Kind, "Opaque">, ctx: Ctx): boolean {
   switch (kind) {
     case "Object":
     case "Arguments":
@@ -590,13 +630,13 @@ function equalContents(a: object, b: object, kind: Exclude<Kind, "Opaque">, memo
       return (
         Object.is(read(a, "name"), read(b, "name")) &&
         Object.is(read(a, "message"), read(b, "message")) &&
-        sameOptionalOwn(a, b, "cause", memo) &&
-        sameOptionalOwn(a, b, "errors", memo)
+        sameOptionalOwn(a, b, "cause", ctx) &&
+        sameOptionalOwn(a, b, "errors", ctx)
       );
     case "Map":
-      return mapsEqual(a, b, memo);
+      return mapsEqual(a, b, ctx);
     case "Set":
-      return setsEqual(a, b, memo);
+      return setsEqual(a, b, ctx);
     case "ArrayBuffer":
     case "SharedArrayBuffer":
       return bytesEqual(bufferBytes(a, kind), bufferBytes(b, kind));
@@ -611,21 +651,22 @@ function equalContents(a: object, b: object, kind: Exclude<Kind, "Opaque">, memo
 }
 
 /** Own enumerable keys and values; typed arrays skip index keys (elements were compared already). */
-function sameOwnProperties(a: object, b: object, skipIndexKeys: boolean, memo: PairMemo): boolean {
+function sameOwnProperties(a: object, b: object, skipIndexKeys: boolean, ctx: Ctx): boolean {
   const keep = (key: string | symbol): boolean => !skipIndexKeys || !isIndexKey(key);
   const keysA = ownEnumerableKeys(a).filter(keep);
-  if (keysA.length !== ownEnumerableKeys(b).filter(keep).length) return false;
-  for (const key of keysA) {
-    if (propertyIsEnumerable(b, key) !== true) return false;
-    if (!equal(read(a, key), read(b, key), memo)) return false;
+  const keysB = ownEnumerableKeys(b).filter(keep);
+  if (keysA.length !== keysB.length) return false;
+  for (const [index, key] of keysA.entries()) {
+    if (ctx.ordered ? keysB[index] !== key : propertyIsEnumerable(b, key) !== true) return false;
+    if (!equal(read(a, key), read(b, key), ctx)) return false;
   }
   return true;
 }
 
-function sameOptionalOwn(a: object, b: object, key: string, memo: PairMemo): boolean {
+function sameOptionalOwn(a: object, b: object, key: string, ctx: Ctx): boolean {
   const inA = hasOwnProperty(a, key) === true;
   if (inA !== (hasOwnProperty(b, key) === true)) return false;
-  return !inA || equal(read(a, key), read(b, key), memo);
+  return !inA || equal(read(a, key), read(b, key), ctx);
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -647,12 +688,18 @@ function elementsEqual(a: object, b: object): boolean {
   return true;
 }
 
-function mapsEqual(a: object, b: object, memo: PairMemo): boolean {
+function mapsEqual(a: object, b: object, ctx: Ctx): boolean {
   if (mapSize(a) !== mapSize(b)) return false;
+  if (ctx.ordered) {
+    const entriesB = mapEntries(b);
+    return mapEntries(a).every(
+      ([keyA, valueA], index) => equal(keyA, entriesB[index]?.[0], ctx) && equal(valueA, entriesB[index]?.[1], ctx),
+    );
+  }
   const objectKeyedA: [unknown, unknown][] = [];
   for (const [key, value] of mapEntries(a)) {
     if (isIdentityKey(key)) {
-      if (mapHas(b, key) !== true || !equal(value, mapGet(b, key), memo)) return false;
+      if (mapHas(b, key) !== true || !equal(value, mapGet(b, key), ctx)) return false;
     } else {
       objectKeyedA.push([key, value]);
     }
@@ -661,15 +708,19 @@ function mapsEqual(a: object, b: object, memo: PairMemo): boolean {
   if (objectKeyedA.length !== objectKeyedB.length) return false;
   // deepEqual is an equivalence relation, so greedy one-to-one matching is exact.
   for (const [keyA, valueA] of objectKeyedA) {
-    const index = objectKeyedB.findIndex(([keyB, valueB]) => equal(keyA, keyB, memo) && equal(valueA, valueB, memo));
+    const index = objectKeyedB.findIndex(([keyB, valueB]) => equal(keyA, keyB, ctx) && equal(valueA, valueB, ctx));
     if (index === -1) return false;
     objectKeyedB.splice(index, 1);
   }
   return true;
 }
 
-function setsEqual(a: object, b: object, memo: PairMemo): boolean {
+function setsEqual(a: object, b: object, ctx: Ctx): boolean {
   if (setSize(a) !== setSize(b)) return false;
+  if (ctx.ordered) {
+    const membersB = setValues(b);
+    return setValues(a).every((member, index) => equal(member, membersB[index], ctx));
+  }
   const objectsA: unknown[] = [];
   for (const member of setValues(a)) {
     if (isIdentityKey(member)) {
@@ -681,7 +732,7 @@ function setsEqual(a: object, b: object, memo: PairMemo): boolean {
   const objectsB = setValues(b).filter((member) => !isIdentityKey(member));
   if (objectsA.length !== objectsB.length) return false;
   for (const member of objectsA) {
-    const index = objectsB.findIndex((other) => equal(member, other, memo));
+    const index = objectsB.findIndex((other) => equal(member, other, ctx));
     if (index === -1) return false;
     objectsB.splice(index, 1);
   }

@@ -26,9 +26,11 @@
  */
 
 import { deepEqual, kindOf, regExpParts } from "./deepEqual.js";
+import type { DeepEqualOptions } from "./deepEqual.js";
 import { snapshot } from "./snapshot.js";
 
 export { deepEqual };
+export type { DeepEqualOptions };
 
 // ---------------------------------------------------------------------------
 // 1. assertPayoutInvariance — runtime invariance under payout mutation.
@@ -85,6 +87,18 @@ export interface AssertPayoutInvarianceOptions<TInput, TResult> {
    * `assertPayoutInvariance` throw.
    */
   hasChanged?: (baseInput: TInput, mutatedInput: TInput) => boolean;
+  /**
+   * Make the order of a `Map`'s entries, a `Set`'s members and an object's
+   * own enumerable keys significant. Defaults to false: those three are
+   * compared without regard to order, so a ranker that returns its ranking
+   * as a `Set`, a `Map` or a keyed object can reorder it without failing the
+   * check. If your ranker returns one of those in rank order, pass
+   * `orderSensitive: true` or return an array (array order always matters).
+   * Applies to the default `isEqual`, the default `hasChanged` and the
+   * in-place-change checks; a custom `isEqual` or `hasChanged` decides for
+   * itself. Must be a boolean when given.
+   */
+  orderSensitive?: boolean;
 }
 
 /** One scenario whose ranking result differed from the baseline. */
@@ -217,8 +231,8 @@ function snapshotMutations<TInput>(mutations: unknown): PayoutMutationScenario<T
 type Hook = ((...args: never[]) => unknown) | undefined;
 
 /** Read `opts` once: undefined or a plain object whose hooks are functions or undefined. */
-function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook } {
-  if (opts === undefined) return { isEqual: undefined, hasChanged: undefined };
+function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook; orderSensitive: boolean } {
+  if (opts === undefined) return { isEqual: undefined, hasChanged: undefined, orderSensitive: false };
   if (!isPlainRecord(opts)) {
     throw new TypeError("assertPayoutInvariance: opts must be a plain object (or omitted).");
   }
@@ -232,7 +246,11 @@ function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook } 
       throw new TypeError(`assertPayoutInvariance: opts.${hook} must be a function (or omitted).`);
     }
   }
-  return { isEqual: isEqual as Hook, hasChanged: hasChanged as Hook };
+  const orderSensitive = opts.orderSensitive;
+  if (orderSensitive !== undefined && typeof orderSensitive !== "boolean") {
+    throw new TypeError("assertPayoutInvariance: opts.orderSensitive must be a boolean (or omitted).");
+  }
+  return { isEqual: isEqual as Hook, hasChanged: hasChanged as Hook, orderSensitive: orderSensitive === true };
 }
 
 /**
@@ -277,6 +295,13 @@ function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook } 
  *   whether payout actually changed the ranking.
  * - `isEqual` or `hasChanged` returns anything but a boolean (for example a
  *   Promise, which is always truthy and would make every scenario "pass").
+ * - `rankFn` returns `undefined` on the baseline input (almost always a
+ *   forgotten `return`). `null` and `NaN` are accepted as ordinary values; a
+ *   later call that returns `undefined` is reported as a failure.
+ *
+ * The default comparison ignores the order of a `Map`'s entries, a `Set`'s
+ * members and an object's keys. If the ranker returns one of those in rank
+ * order, pass `{ orderSensitive: true }` or return an array.
  */
 export function assertPayoutInvariance<TInput, TResult>(
   rankFn: (input: TInput) => TResult,
@@ -289,14 +314,15 @@ export function assertPayoutInvariance<TInput, TResult>(
   }
   const list = snapshotMutations<TInput>(mutations);
   const options = readRuntimeOptions(opts);
-  const isEqual = (options.isEqual as ((expected: TResult, actual: TResult) => unknown) | undefined) ?? deepEqual;
+  const sameValue = (x: unknown, y: unknown): boolean => deepEqual(x, y, { orderSensitive: options.orderSensitive });
+  const isEqual = (options.isEqual as ((expected: TResult, actual: TResult) => unknown) | undefined) ?? sameValue;
   const hasChanged =
     (options.hasChanged as ((base: TInput, mutated: TInput) => unknown) | undefined) ??
-    ((base: TInput, mutated: TInput) => !deepEqual(base, mutated));
+    ((base: TInput, mutated: TInput) => !sameValue(base, mutated));
 
   const pristineInput = snapshot(baseInput);
   const assertBaseUntouched = (who: string): void => {
-    if (!deepEqual(pristineInput, baseInput)) {
+    if (!sameValue(pristineInput, baseInput)) {
       throw new Error(
         `assertPayoutInvariance: ${who} modified baseInput in place. Neither rankFn nor mutate may change ` +
           `their argument (copy before sorting or editing); every scenario starts from the same baseInput, ` +
@@ -343,6 +369,13 @@ export function assertPayoutInvariance<TInput, TResult>(
   };
 
   const baseline = callRankFn(baseInput, "on the baseline input");
+  if (baseline === undefined) {
+    throw new TypeError(
+      "assertPayoutInvariance: rankFn returned undefined on the baseline input. That is almost always a " +
+        "forgotten `return`, and a ranker that always returns undefined would pass every scenario. Return " +
+        "the ranking (an empty array for an empty ranking).",
+    );
+  }
   assertBaseUntouched("rankFn (on the baseline input)");
   // rankFn may return an object it later reuses (a buffer it clears and
   // refills). If a later call rewrote the baseline result in place, baseline
@@ -383,7 +416,7 @@ export function assertPayoutInvariance<TInput, TResult>(
       `on the mutated input for ${label} (it did not throw on the baseline input)`,
     );
     assertBaseUntouched(`${label}: rankFn`);
-    if (!deepEqual(baselineCopy, baseline)) {
+    if (!sameValue(baselineCopy, baseline)) {
       throw new Error(
         `assertPayoutInvariance: rankFn modified its earlier (baseline) result in place during ${label}. ` +
           `Return a fresh value from every call, or the baseline can no longer be compared.`,
@@ -427,19 +460,21 @@ export interface AssertNoPayoutImportsOptions {
    * literals (across lines, including nested `${ }` expressions) and regex
    * literals are skipped, so a `//` or `/*` inside one (e.g.
    * `"https://example.com/payout"`, or `rm -rf dist/*` in a template) is not
-   * mistaken for a comment. This is a small lexer, not a parser — see
-   * README.md "Honest limits": a regex literal right after `)` or `]` is
-   * read as division, and a lone backtick in JSX text opens a template that
-   * never closes; after either, a `/*` can hide the code that follows. Pass
-   * `false` for files like that. Must be a boolean when given. Defaults to
-   * true.
+   * mistaken for a comment. A `//` comment ends at `\n`, `\r`, U+2028 or
+   * U+2029. JSX closing and self-closing tags and `i++ / 2` are not read as
+   * regex starts. This is a small lexer, not a parser; see README.md "Honest
+   * limits": a regex literal right after `)` or `]` is read as division, a
+   * lone backtick in JSX text opens a template that never closes, and JSX
+   * text is not tokenized; after any of these, a `/*` or `//` can hide the
+   * code that follows. Pass `false` for files like that. Must be a boolean
+   * when given. Defaults to true.
    */
   stripComments?: boolean;
   /**
-   * Case-insensitive matching for string identifiers (RegExp patterns are
-   * used as-is; give them their own `i` flag if you want that). Defaults to
-   * true, since missing a reference due to casing is worse than an
-   * occasional over-match. Must be a boolean when given.
+   * Case-insensitive matching for string identifiers, in any script (RegExp
+   * patterns are used as written; give them their own `i` flag if you want
+   * that). Defaults to true, since missing a reference due to casing is
+   * worse than an occasional over-match. Must be a boolean when given.
    */
   caseInsensitive?: boolean;
 }
@@ -461,17 +496,35 @@ function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Build a word-boundary matcher regex for one plain-string identifier. */
+/** Characters that continue an identifier for word-boundary purposes: letters, digits, combining marks, `_`. */
+const IDENTIFIER_CHARS = "\\p{L}\\p{N}\\p{M}_";
+const STARTS_WITH_IDENTIFIER_CHAR = new RegExp(`^[${IDENTIFIER_CHARS}]`, "u");
+const ENDS_WITH_IDENTIFIER_CHAR = new RegExp(`[${IDENTIFIER_CHARS}]$`, "u");
+
+/**
+ * Build a matcher regex for one plain-string identifier.
+ *
+ * Word boundaries are Unicode-aware lookarounds, not `\b` (which only knows
+ * ASCII letters, digits and `_`): the identifier must not be directly
+ * preceded or followed by a letter, digit, combining mark or `_` in any
+ * script. So "комиссия" and "佣金" are found, and "commission" is not found
+ * inside "commissionés". A boundary is only required on a side where the
+ * identifier itself starts or ends with such a character, so "$payout",
+ * "@payout/core" and "rate%" are found too. `$` does not continue an
+ * identifier here, so "payout" is still found in a Svelte-style `$payout`.
+ * It will NOT catch this identifier as a fragment of a larger camelCase or
+ * snake_case identifier (e.g. "payout" inside "computePayoutForCard" or
+ * "payout_rate_bps"), pass a RegExp without a boundary (e.g. /payout/i) for
+ * that.
+ */
 function toMatcher(identifier: string, caseInsensitive: boolean): RegExp {
-  // \b works on word characters, so this also catches identifiers embedded
-  // in import specifiers like "@/lib/affiliate" (the '/' and quote around
-  // it are non-word characters, so the boundary still lands correctly).
-  // It will NOT catch this identifier as a fragment of a larger camelCase or
-  // snake_case identifier (e.g. "payout" inside "computePayoutForCard" or
-  // "payout_rate_bps") — pass a RegExp without \b (e.g. /payout/i) for that.
-  const flags = "g" + (caseInsensitive ? "i" : "");
-  return new RegExp(`\\b${escapeRegExp(identifier)}\\b`, flags);
+  const before = STARTS_WITH_IDENTIFIER_CHAR.test(identifier) ? `(?<![${IDENTIFIER_CHARS}])` : "";
+  const after = ENDS_WITH_IDENTIFIER_CHAR.test(identifier) ? `(?![${IDENTIFIER_CHARS}])` : "";
+  return new RegExp(`${before}${escapeRegExp(identifier)}${after}`, "gu" + (caseInsensitive ? "i" : ""));
 }
+
+/** Leading and trailing whitespace and invisible (default-ignorable) characters of an identifier. */
+const IDENTIFIER_PADDING = /^[\s\p{Default_Ignorable_Code_Point}]+|[\s\p{Default_Ignorable_Code_Point}]+$/gu;
 
 /** Keywords after which a `/` starts a regular expression, not a division. */
 const REGEX_AFTER_KEYWORD = new Set([
@@ -494,8 +547,21 @@ const REGEX_AFTER_KEYWORD = new Set([
 /** Punctuators after which a `/` starts a regular expression, not a division. */
 const REGEX_AFTER_PUNCTUATOR = new Set([..."(,=:[!&|?{};+-*%<>~^}"]);
 
+/** The line terminators of JavaScript: LF, CR, U+2028 and U+2029. A `//` comment ends at any of them. */
+function isLineTerminator(ch: string): boolean {
+  return ch === "\n" || ch === "\r" || ch === "\u2028" || ch === "\u2029";
+}
+
 function isWordChar(ch: string): boolean {
   return /[\p{ID_Continue}$]/u.test(ch);
+}
+
+/** Index of the first line terminator at or after `from`, or the end of `src`. */
+function endOfLine(src: string, from: number): number {
+  for (let j = from; j < src.length; j += 1) {
+    if (isLineTerminator(src.charAt(j))) return j;
+  }
+  return src.length;
 }
 
 /** Index just past a quoted string that starts at `start`, or of the line break that ends it unterminated. */
@@ -504,11 +570,12 @@ function endOfQuoted(src: string, start: number, quote: string): number {
   while (j < src.length) {
     const ch = src.charAt(j);
     if (ch === "\\") {
-      j += 2; // an escape, including a line continuation
+      // An escape, including a line continuation (a CRLF counts as one).
+      j += src.charAt(j + 1) === "\r" && src.charAt(j + 2) === "\n" ? 3 : 2;
       continue;
     }
     if (ch === quote) return j + 1;
-    if (ch === "\n") return j;
+    if (ch === "\n" || ch === "\r") return j;
     j += 1;
   }
   return src.length;
@@ -520,9 +587,9 @@ function endOfRegex(src: string, start: number): number {
   let j = start + 1;
   while (j < src.length) {
     const ch = src.charAt(j);
-    if (ch === "\n") return j;
+    if (isLineTerminator(ch)) return j;
     if (ch === "\\") {
-      if (src.charAt(j + 1) === "\n") return j + 1;
+      if (isLineTerminator(src.charAt(j + 1))) return j + 1;
       j += 2;
       continue;
     }
@@ -544,23 +611,63 @@ type LexFrame = { kind: "template" } | { kind: "expression"; braces: number };
  * break), template literals across lines (including nested `${ }`
  * expressions, with brace depth tracked, and the strings, templates and
  * comments inside them), and regular-expression literals, so a `//` or `/*`
- * inside any of those is not mistaken for a comment. A `/` starts a regex
- * literal when it follows an operator, an opening bracket, `;`, `}`, the
- * start of the file, or a keyword such as `return`; otherwise it is division.
- * A block comment is replaced by one space (never by nothing), so the tokens
- * on either side of it stay separate.
+ * inside any of those is not mistaken for a comment. A line comment ends at
+ * any JavaScript line terminator (`\n`, `\r`, U+2028 or U+2029). A block
+ * comment is replaced by one space (never by nothing), so the tokens on either
+ * side of it stay separate.
+ *
+ * Whether a `/` starts a regex literal or is a division (or part of JSX) is
+ * guessed from the code before it:
+ * - at the start of the file, after a keyword such as `return`, or after an
+ *   operator or opening bracket, it starts a regex;
+ * - right after `<` (`</div>`, a JSX closing tag) it does not, but `a < /re/`
+ *   with a space does;
+ * - after a `}` or `>` it does not when the next character is `>` (a
+ *   self-closing tag, `<Foo a={1} />`); after a `}` it does when a line
+ *   break came first (a statement that starts with a regex), and otherwise
+ *   only when the `/` is not followed by a space or `=` (so `{a} / {b}`
+ *   divides and `} /re/.test(s)` is a regex);
+ * - after `++` or `--` it does not (`i++ / 2`), but after a single `+` or `-`
+ *   it does.
  *
  * Known limits: a regex literal right after `)` or `]` (`if (ok) /re/`) is
- * read as division, and a lone backtick in JSX text opens a template literal
- * that never closes. Either can desynchronize the lexer, and a later `/*` can
- * then hide the code after it.
+ * read as division, JSX text is not tokenized (a `//` in it starts a
+ * comment), and a lone backtick in
+ * JSX text opens a template literal that never closes. Either can
+ * desynchronize the lexer, and a later `/*` can then hide the code after it.
  */
 function removeComments(src: string): string {
   const frames: LexFrame[] = [];
   let out = "";
   let prev = ""; // last significant code character ("" at the start of the file)
+  let prevIndex = -1; // where `prev` is in `src`, or -1 when it ends a string, template or regex
+  let lineBreak = false; // a line terminator came after `prev`
   let word = ""; // the identifier or keyword that ends at `prev`
   let i = 0;
+
+  /** True when a `/` at index `at` starts a regex literal rather than dividing. */
+  const startsRegex = (at: number): boolean => {
+    if (prev === "") return true;
+    if (isWordChar(prev)) return REGEX_AFTER_KEYWORD.has(word);
+    if (!REGEX_AFTER_PUNCTUATOR.has(prev)) return false;
+    const adjacent = prevIndex === at - 1;
+    switch (prev) {
+      case "<":
+        return !adjacent; // `</div>` closes a tag
+      case "}":
+        if (src.charAt(at + 1) === ">") return false; // `<Foo a={1} />`
+        if (lineBreak) return true; // a statement on a later line starts a regex
+        return !/[\s=]/.test(src.charAt(at + 1)); // `{a} / {b}` and `/=` divide; `} /re/.test(s)` is a regex
+      case ">":
+        return src.charAt(at + 1) !== ">" || lineBreak; // `<Foo<T> />`
+      case "+":
+      case "-":
+        return !(prevIndex > 0 && src.charAt(prevIndex - 1) === prev); // `i++ / 2` divides
+      default:
+        return true;
+    }
+  };
+
   while (i < src.length) {
     const ch = src.charAt(i);
     const frame = frames.at(-1);
@@ -573,11 +680,15 @@ function removeComments(src: string): string {
         frames.pop();
         out += ch;
         prev = ch;
+        prevIndex = -1;
+        lineBreak = false;
         i += 1;
       } else if (ch === "$" && src.charAt(i + 1) === "{") {
         frames.push({ kind: "expression", braces: 0 });
         out += "${";
         prev = "{";
+        prevIndex = -1;
+        lineBreak = false;
         i += 2;
       } else {
         out += ch;
@@ -588,8 +699,7 @@ function removeComments(src: string): string {
 
     const next = src.charAt(i + 1);
     if (ch === "/" && next === "/") {
-      const end = src.indexOf("\n", i);
-      i = end === -1 ? src.length : end; // keep the line break itself
+      i = endOfLine(src, i); // keep the line break itself
       continue;
     }
     if (ch === "/" && next === "*") {
@@ -598,7 +708,9 @@ function removeComments(src: string): string {
       // Leave a space where the comment was, so `return/* x */commission`
       // still reads as two tokens (and `pay/* x */out` does not become one),
       // plus the comment's own line breaks.
-      out += " " + src.slice(i + 2, stop).replace(/[^\n]/g, "");
+      const inside = src.slice(i + 2, stop);
+      if (/[\n\r\u2028\u2029]/.test(inside)) lineBreak = true;
+      out += " " + inside.replace(/[^\r\n]/g, "");
       i = end === -1 ? src.length : end + 2;
       continue;
     }
@@ -606,6 +718,8 @@ function removeComments(src: string): string {
       const end = endOfQuoted(src, i, ch);
       out += src.slice(i, end);
       prev = ch;
+      prevIndex = -1;
+      lineBreak = false;
       i = end;
       continue;
     }
@@ -615,10 +729,12 @@ function removeComments(src: string): string {
       i += 1;
       continue;
     }
-    if (ch === "/" && (prev === "" || (isWordChar(prev) ? REGEX_AFTER_KEYWORD.has(word) : REGEX_AFTER_PUNCTUATOR.has(prev)))) {
+    if (ch === "/" && startsRegex(i)) {
       const end = endOfRegex(src, i);
       out += src.slice(i, end);
       prev = ")"; // a `/` right after a regex literal divides
+      prevIndex = -1;
+      lineBreak = false;
       i = end;
       continue;
     }
@@ -638,6 +754,10 @@ function removeComments(src: string): string {
     if (!/\s/.test(ch)) {
       word = isWordChar(ch) ? (isWordChar(src.charAt(i - 1)) ? word + ch : ch) : "";
       prev = ch;
+      prevIndex = i;
+      lineBreak = false;
+    } else if (isLineTerminator(ch)) {
+      lineBreak = true;
     }
     out += ch;
     i += 1;
@@ -705,21 +825,66 @@ function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { l
     }
     const identifier: unknown = payoutIdentifiers[index];
     if (typeof identifier === "string") {
-      if (isBlank(identifier)) {
+      const trimmed = identifier.replace(IDENTIFIER_PADDING, "");
+      if (trimmed === "") {
         throw new TypeError(
           `assertNoPayoutImports: payoutIdentifiers[${index}] is blank (only whitespace or invisible characters).`,
         );
       }
-      matchers.push({ label: identifier, regex: toMatcher(identifier, caseInsensitive) });
+      matchers.push({ label: trimmed, regex: toMatcher(trimmed, caseInsensitive) });
     } else if (typeof identifier === "object" && identifier !== null && kindOf(identifier) === "RegExp") {
       // Read through the RegExp's internal slots, not its own `source`/`flags`.
+      // The pattern runs over the whole file (see `findMatches`): `g` makes it
+      // find every match, `m` keeps `^` and `$` meaning line start and end, and
+      // a sticky `y` would only match at one position, so it is dropped.
       const { source, flags } = regExpParts(identifier);
-      matchers.push({ label: source, regex: new RegExp(source, flags.includes("g") ? flags : flags + "g") });
+      const scanFlags = [...new Set([...flags.replace("y", ""), "g", "m"])].join("");
+      matchers.push({ label: source, regex: new RegExp(source, scanFlags) });
     } else {
       throw new TypeError(`assertNoPayoutImports: payoutIdentifiers[${index}] must be a string or a RegExp.`);
     }
   }
   return matchers;
+}
+
+/** The text and start offset of every line of `content` (lines end at LF, CRLF or a lone CR). */
+function splitLines(content: string): { text: string; start: number }[] {
+  const lines: { text: string; start: number }[] = [];
+  const terminator = /\r\n|\r|\n/g;
+  let start = 0;
+  for (let found = terminator.exec(content); found !== null; found = terminator.exec(content)) {
+    lines.push({ text: content.slice(start, found.index), start });
+    start = found.index + found[0].length;
+  }
+  lines.push({ text: content.slice(start), start });
+  return lines;
+}
+
+/**
+ * Run every matcher over the whole content (so a pattern may span lines) and
+ * report each line where a match starts, once per matcher, in line order.
+ */
+function findMatches(content: string, matchers: { label: string; regex: RegExp }[]): PayoutImportOffense["matches"] {
+  const lines = splitLines(content);
+  const found: { line: number; order: number; match: PayoutImportOffense["matches"][number] }[] = [];
+  matchers.forEach(({ label, regex }, order) => {
+    regex.lastIndex = 0;
+    let lineIndex = 0;
+    let reported = -1;
+    for (let hit = regex.exec(content); hit !== null; hit = regex.exec(content)) {
+      if (hit[0] === "") regex.lastIndex += 1; // an empty match must not loop forever
+      while (lineIndex + 1 < lines.length && (lines[lineIndex + 1]?.start ?? Infinity) <= hit.index) lineIndex += 1;
+      if (lineIndex === reported) continue;
+      reported = lineIndex;
+      found.push({
+        line: lineIndex + 1,
+        order,
+        match: { identifier: label, line: lineIndex + 1, text: (lines[lineIndex]?.text ?? "").trim() },
+      });
+    }
+  });
+  found.sort((x, y) => x.line - y.line || x.order - y.order);
+  return found.map((entry) => entry.match);
 }
 
 /**
@@ -769,9 +934,12 @@ function readSourceFiles(files: unknown): [string, string][] {
  * access at all — use this for non-Node runtimes or when you've already
  * walked an import graph yourself and gathered the file contents).
  *
- * `payoutIdentifiers` is a list of plain identifiers (matched as whole
- * words / import-path segments, e.g. `"commission"`, `"affiliateRate"`,
- * `"payout"`) and/or regular expressions for more specific patterns.
+ * `payoutIdentifiers` is a list of plain identifiers (trimmed, then matched
+ * as whole words / import-path segments with Unicode-aware boundaries, e.g.
+ * `"commission"`, `"affiliateRate"`, `"payout"`, `"комиссия"`) and/or regular
+ * expressions for more specific patterns. A RegExp runs over the whole file
+ * (with `g` and `m` added and `y` dropped) and is reported at the line where
+ * each match starts.
  *
  * Returns the list of offending files (empty if none) so a caller's test
  * can assert that list is empty:
@@ -811,17 +979,7 @@ export function assertNoPayoutImports(
 
   for (const [path, rawContent] of sources) {
     const content = stripComments ? removeComments(rawContent) : rawContent;
-    const lines = content.split("\n");
-    const matches: PayoutImportOffense["matches"] = [];
-
-    lines.forEach((lineText, idx) => {
-      for (const { label, regex } of matchers) {
-        regex.lastIndex = 0;
-        if (regex.test(lineText)) {
-          matches.push({ identifier: label, line: idx + 1, text: lineText.trim() });
-        }
-      }
-    });
+    const matches = findMatches(content, matchers);
 
     if (matches.length > 0) {
       offenses.push({ file: path, matches });
