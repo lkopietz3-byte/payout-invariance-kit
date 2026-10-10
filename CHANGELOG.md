@@ -61,6 +61,26 @@ so the next release should be a minor version. No version bump here.
   apply) only after a JSX opener was seen. An arrow body that is a regex
   (`x => />/.test(s)`) is read as a regex.
 
+- The shared comparison and copy code (`src/deepEqual.ts` and `src/snapshot.ts`)
+  is synced with mutation-invariance-kit and is byte-identical to it again.
+  What changes for you:
+  - Very deeply nested input no longer gives a wrong answer. Two identical
+    object chains 100,000 levels deep were reported as different, and two
+    identical nested arrays of that depth threw a stack overflow. Both now
+    compare as equal, and a difference at the bottom is still found. The copy
+    of the input is now built without recursion, so depth is limited by memory.
+  - A stack overflow raised while a value is being classified now surfaces as
+    an error instead of being read as "not comparable".
+  - Arrays and typed arrays take a faster path when they have no hole and no
+    extra key. Each element is read once, so a getter that returns a different
+    value on each read cannot make a comparison inconsistent, an array Proxy
+    that lists its keys out of order is compared by index, and elements are
+    copied with `Array.from` so a setter left on `Array.prototype` cannot
+    swallow them.
+  - The copy fills Maps and Sets with the real `Map.prototype.set` and
+    `Set.prototype.add`, never the input's own overrides, and very wide inputs
+    (150,000 elements or named keys) no longer hit the argument limit.
+
 ### Changed (behavior)
 
 - New option `orderSensitive` (default `false`) on `assertPayoutInvariance` and
