@@ -562,6 +562,12 @@ const REGEX_AFTER_KEYWORD = new Set([
 /** Punctuators after which a `/` starts a regular expression, not a division. */
 const REGEX_AFTER_PUNCTUATOR = new Set([..."(,=:[!&|?{};+-*%<>~^}"]);
 
+/** Keywords directly followed by a statement block (`else {`, `catch {`, `static {`). */
+const BLOCK_AFTER_KEYWORD = new Set(["else", "try", "finally", "do", "catch", "static"]);
+
+/** Keywords that start a declaration or clause whose `{` opens a body (a class body, a case block). */
+const BLOCK_CUE_KEYWORD = new Set(["class", "interface", "enum", "namespace", "module", "case", "default"]);
+
 /** The line terminators of JavaScript: LF, CR, U+2028 and U+2029. A `//` comment ends at any of them. */
 function isLineTerminator(ch: string): boolean {
   return ch === "\n" || ch === "\r" || ch === "\u2028" || ch === "\u2029";
@@ -619,6 +625,21 @@ function endOfRegex(src: string, start: number): number {
 /** A JSX closing tag, from its `/` on: `/div>`, `/>`, `/Ui.Card >`, `/svg:g>`. */
 const closingTag = /\/\s*(?:[\p{ID_Start}_$][\p{ID_Continue}$.:-]*\s*)?>/uy;
 
+/**
+ * Whether JSX tag rules apply to a file: always in `.jsx` and `.tsx`, never in
+ * `.ts`, `.mts` and `.cts` (TypeScript has no JSX there), and in any other
+ * file (`.js`, `.svelte`, a name with no extension) only after a JSX opener
+ * such as `<Foo` or `<>` has been seen in a place where an expression can start.
+ */
+type JsxMode = "always" | "never" | "auto";
+
+function jsxModeFor(path: string): JsxMode {
+  const extension = /\.([A-Za-z0-9]+)$/.exec(path)?.[1]?.toLowerCase() ?? "";
+  if (extension === "jsx" || extension === "tsx") return "always";
+  if (extension === "ts" || extension === "mts" || extension === "cts") return "never";
+  return "auto";
+}
+
 /** An open template literal, or a `${ }` expression inside one (with the `{` opened inside it). */
 type LexFrame = { kind: "template" } | { kind: "expression"; braces: number };
 
@@ -658,7 +679,7 @@ type LexFrame = { kind: "template" } | { kind: "expression"; braces: number };
  * JSX text opens a template literal that never closes. Either can
  * desynchronize the lexer, and a later `/*` can then hide the code after it.
  */
-function removeComments(src: string): string {
+function removeComments(src: string, jsxMode: JsxMode): string {
   const frames: LexFrame[] = [];
   let out = "";
   let prev = ""; // last significant code character ("" at the start of the file)
@@ -667,12 +688,19 @@ function removeComments(src: string): string {
   let word = ""; // the identifier or keyword that ends at `prev`
   const braces: boolean[] = []; // for each open `{` in code: true when it opens a statement block
   let closedBlock = true; // whether the `}` that is `prev` closed a statement block
+  let blockCue = false; // `class`, `case` or similar was read in this statement, so the next `{` is a body
+  let jsxSeen = false; // a JSX opener (`<Foo`, `<>`) was read
+  const jsxOn = (): boolean => jsxMode === "always" || (jsxMode === "auto" && jsxSeen);
   let i = 0;
+
+  /** True when the code before the current character is one after which an expression can start. */
+  const startsExpression = (): boolean =>
+    prev === "" || (isWordChar(prev) ? REGEX_AFTER_KEYWORD.has(word) : REGEX_AFTER_PUNCTUATOR.has(prev));
 
   /** True when the `{` being read opens a statement block (`if (x) {`), false for an object literal or JSX expression. */
   const opensBlock = (): boolean => {
-    if (prev === "") return true;
-    if (isWordChar(prev)) return word === "else" || word === "try" || word === "finally" || word === "do";
+    if (blockCue || prev === "") return true;
+    if (isWordChar(prev)) return BLOCK_AFTER_KEYWORD.has(word);
     switch (prev) {
       case ")":
       case ";":
@@ -683,9 +711,24 @@ function removeComments(src: string): string {
         return braces.at(-1) ?? true; // directly inside a block is a block; inside an object it is an object
       case ">":
         return src.charAt(prevIndex - 1) === "="; // `=> {` is a body, `<p>{` is a JSX expression
+      case ":":
+        return isLabel(prevIndex); // `outer: {` is a labeled block, `a: {` is an object property
       default:
         return false;
     }
+  };
+
+  /** True when the `:` at `colon` ends a statement label (`outer:`) rather than a property name or a ternary branch. */
+  const isLabel = (colon: number): boolean => {
+    let j = colon - 1;
+    while (j >= 0 && /\s/.test(src.charAt(j))) j -= 1;
+    const labelEnd = j;
+    while (j >= 0 && isWordChar(src.charAt(j))) j -= 1;
+    if (j === labelEnd) return false;
+    while (j >= 0 && /\s/.test(src.charAt(j))) j -= 1;
+    const before = j >= 0 ? src.charAt(j) : "";
+    if (before === "" || before === ";" || before === "}") return true;
+    return before === "{" && (braces.at(-1) ?? true); // a label is the first thing in a block; a property is the first thing in an object
   };
 
   /** True when the `++` or `--` that ends at `prev` is postfix (`i++`, `a[0]--`), judged by what precedes it. */
@@ -704,14 +747,15 @@ function removeComments(src: string): string {
     switch (prev) {
       case "<": {
         // `</div>`, `</>` and `</a.b>` close a JSX tag. Anything else after `</` is a regex.
-        if (prevIndex !== at - 1) return true;
+        if (!jsxOn() || prevIndex !== at - 1) return true;
         closingTag.lastIndex = at;
         return !closingTag.test(src);
       }
       case "}":
-        if (src.charAt(at + 1) === ">") return false; // `<Foo {...p} />`
+        if (jsxOn() && src.charAt(at + 1) === ">") return false; // `<Foo {...p} />`
         return closedBlock; // after a statement block a slash starts a regex; after an expression it divides
       case ">":
+        if (!jsxOn() || src.charAt(prevIndex - 1) === "=") return true; // `x => />/.test(s)`
         return src.charAt(at + 1) !== ">" || lineBreak; // `<Foo<T> />`
       case "+":
       case "-":
@@ -805,9 +849,19 @@ function removeComments(src: string): string {
       }
     }
     if (!/\s/.test(ch)) {
-      if (ch === "{") braces.push(opensBlock());
-      else if (ch === "}") closedBlock = braces.pop() ?? true;
+      if (ch === "{") {
+        braces.push(opensBlock());
+        blockCue = false;
+      } else if (ch === "}") {
+        closedBlock = braces.pop() ?? true;
+        blockCue = false;
+      } else if (ch === ";" || ch === "=") {
+        blockCue = false;
+      } else if (ch === "<" && jsxMode !== "never" && startsExpression() && /[\p{ID_Start}$_>]/u.test(src.charAt(i + 1))) {
+        jsxSeen = true; // `<Foo` or `<>` where an expression can start: JSX
+      }
       word = isWordChar(ch) ? (isWordChar(src.charAt(i - 1)) ? word + ch : ch) : "";
+      if (isWordChar(ch) && !isWordChar(src.charAt(i + 1)) && BLOCK_CUE_KEYWORD.has(word)) blockCue = true;
       prev = ch;
       prevIndex = i;
       lineBreak = false;
@@ -1038,7 +1092,7 @@ export function assertNoPayoutImports(
   const offenses: PayoutImportOffense[] = [];
 
   for (const [path, rawContent] of sources) {
-    const content = stripComments ? removeComments(rawContent) : rawContent;
+    const content = stripComments ? removeComments(rawContent, jsxModeFor(path)) : rawContent;
     const matches = findMatches(content, matchers);
 
     if (matches.length > 0) {

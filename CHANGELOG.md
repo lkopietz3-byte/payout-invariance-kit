@@ -52,6 +52,15 @@ so the next release should be a minor version. No version bump here.
   (`t('查看payout报表')`) or `²`/`½` was not found, because those counted as word
   characters. For an identifier with an ASCII edge they no longer do.
 
+- The comment stripper did not treat `catch {}` without a parameter, class
+  bodies, `case`/`default` blocks or labeled blocks as statement blocks, so a
+  regex right after one of them hid real code. A regex or `/>` after `>` was
+  also read as JSX tag syntax in plain comparisons (`a > />[/*]/.test(b)`,
+  `a</foo>[/*]/.test(b)`). JSX tag rules now apply only in `.jsx` and `.tsx`
+  files, and in other files (except `.ts`, `.mts` and `.cts`, where they never
+  apply) only after a JSX opener was seen. An arrow body that is a regex
+  (`x => />/.test(s)`) is read as a regex.
+
 ### Changed (behavior)
 
 - New option `orderSensitive` (default `false`) on `assertPayoutInvariance` and
@@ -81,6 +90,9 @@ so the next release should be a minor version. No version bump here.
   above are in the README.
 - A mixed identifier such as `payout报表` is reported for `"payout"` (the cost
   of finding it in UI strings). A non-ASCII identifier stays strict.
+- The comment stripper is a text heuristic, not a parser. A regex literal that
+  contains `/*` or `//` right after a token it reads differently can still hide
+  code on the same line; pass `stripComments: false` for maximum recall. In a plain `.ts` file JSX is never recognized.
 - Lexer limits that remain: a regex right after `)` or `]` is read as division,
   a lone backtick in JSX text opens a template that never closes, and JSX text
   is not tokenized (a `//` in it starts a comment). No Unicode normalization is

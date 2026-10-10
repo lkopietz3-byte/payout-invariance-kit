@@ -25,18 +25,20 @@ interface StaticCase {
   identifiers: (string | RegExp)[];
   expected: Verdict;
   opts?: { stripComments?: boolean; caseInsensitive?: boolean };
+  /** The file name to scan under; its extension decides whether JSX rules apply. Defaults to file.tsx. */
+  file?: string;
   /** When FLAG: the 1-based lines the first offense must report. */
   lines?: number[];
 }
 
-function scan(source: string, identifiers: (string | RegExp)[], opts?: StaticCase["opts"]) {
-  return assertNoPayoutImports({ "file.tsx": source }, identifiers, opts);
+function scan(source: string, identifiers: (string | RegExp)[], opts?: StaticCase["opts"], file = "file.tsx") {
+  return assertNoPayoutImports({ [file]: source }, identifiers, opts);
 }
 
 function runStaticCases(cases: StaticCase[]): void {
   for (const c of cases) {
     it(`${c.name} -> ${c.expected}`, () => {
-      const offenses = scan(c.source, c.identifiers, c.opts);
+      const offenses = scan(c.source, c.identifiers, c.opts, c.file);
       const verdict: Verdict = offenses.length > 0 ? "FLAG" : "CLEAN";
       expect(verdict).toBe(c.expected);
       if (c.lines) {
@@ -270,6 +272,47 @@ describe("verdict table: static, review round", () => {
     { name: "ASCII identifier with a longer ASCII word between CJK text", source: "t('查看payouts报表');\n", identifiers: ["payout"], expected: "CLEAN" },
     { name: "CJK identifier inside a longer CJK word is not matched (no word breaks in CJK)", source: "const 佣金率 = 1;\n", identifiers: ["佣金"], expected: "CLEAN" },
     { name: "CJK identifier alone", source: "const 佣金 = 1;\n", identifiers: ["佣金"], expected: "FLAG" },
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// Final lexer round: more statement blocks, and JSX rules only in JSX files.
+// ---------------------------------------------------------------------------
+
+describe("verdict table: static, final lexer round", () => {
+  const tail = " /[/*]/.test(s); row.payout; /* */\n";
+  runStaticCases([
+    // Statement blocks that end in a `}` followed by a regex.
+    { name: "regex after try/catch without a parameter", source: "try { a() } catch { b() }" + tail, identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after try/catch with a parameter", source: "try { a() } catch (e) { b() }" + tail, identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after finally", source: "try { a() } finally { b() }" + tail, identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after a class body", source: "class A { m() {} }" + tail, identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after a class body with extends", source: "class A extends B { m() {} }" + tail, identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after a labeled block", source: "outer: { a() }" + tail, identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after a labeled block inside a block", source: "function f() { outer: { a() }" + tail + "}\n", identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after a bare block following a semicolon", source: "a(); { b() }" + tail, identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after a bare block following another block", source: "if (a) { c() } { b() }" + tail, identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after a case block", source: "switch (k) { case 1: { a() }" + tail + "}\n", identifiers: ["payout"], expected: "FLAG" },
+    { name: "regex after a default block", source: "switch (k) { default: { a() }" + tail + "}\n", identifiers: ["payout"], expected: "FLAG" },
+    // Guards: braces that end an expression still divide.
+    { name: "division after a nested object literal property", source: "const v = { a: { b: 1 } } / 2; // payout\n", identifiers: ["payout"], expected: "CLEAN" },
+    { name: "division after an object with a default key", source: "const v = { default: { b: 1 } } / 2; // payout\n", identifiers: ["payout"], expected: "CLEAN" },
+    { name: "division after an object in an argument list", source: "const v = f({ a: 1 }) / 2; // payout\n", identifiers: ["payout"], expected: "CLEAN" },
+    { name: "JSX attribute named class does not make the next brace a block", source: 'const t = <b class="x" title={a} />; // payout\n', identifiers: ["payout"], expected: "CLEAN" },
+    { name: "division after a template-free ternary object", source: "const v = ok ? { a: 1 } : { b: 2 }; const w = v / 2; // payout\n", identifiers: ["payout"], expected: "CLEAN" },
+
+    // JSX tag rules only apply in JSX files.
+    { name: "plain .ts: a regex after > starting with > is a regex", source: "const ok = a > />[/*]/.test(b);\nrow.payout;\n/* */", identifiers: ["payout"], expected: "FLAG", file: "f.ts" },
+    { name: "plain .ts: a regex after </foo> is a regex", source: "const ok = a</foo>[/*]/.test(b);\nrow.payout;\n/* */", identifiers: ["payout"], expected: "FLAG", file: "f.ts" },
+    { name: "plain .js without JSX: a regex after > starting with > is a regex", source: "const ok = a > />[/*]/.test(b);\nrow.payout;\n/* */", identifiers: ["payout"], expected: "FLAG", file: "f.js" },
+    { name: "plain .js without JSX: a regex after </foo> is a regex", source: "const ok = a</foo>[/*]/.test(b);\nrow.payout;\n/* */", identifiers: ["payout"], expected: "FLAG", file: "f.js" },
+    { name: ".tsx: an arrow body that is a regex starting with >", source: "const f = (s: string) => />[/*]/.test(s);\nrow.payout;\n/* */", identifiers: ["payout"], expected: "FLAG" },
+    { name: ".js with a JSX opener still gets the JSX rules", source: "const a = <p>hi</p>; // payout\n", identifiers: ["payout"], expected: "CLEAN", file: "f.js" },
+    { name: ".js with a JSX self-closing tag still gets the JSX rules", source: "const a = <Foo bar={1} />; // payout\n", identifiers: ["payout"], expected: "CLEAN", file: "f.js" },
+    { name: ".jsx always gets the JSX rules", source: "const a = (<ul><li>a</li>{/* payout */}</ul>);\n", identifiers: ["payout"], expected: "CLEAN", file: "f.jsx" },
+    { name: "unknown extension with a JSX opener gets the JSX rules", source: "<script>\n  const a = <p>hi</p>; // payout\n</script>\n", identifiers: ["payout"], expected: "CLEAN", file: "f.svelte" },
+    { name: "plain .ts: closing-tag-looking text is not JSX (documented)", source: "const a = <p>x</p>; // payout\n", identifiers: ["payout"], expected: "FLAG", file: "f.ts" },
+    { name: "plain .ts still divides after postfix ++", source: "let n = i++ / 2; // payout\n", identifiers: ["payout"], expected: "CLEAN", file: "f.ts" },
   ]);
 });
 

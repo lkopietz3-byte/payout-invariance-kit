@@ -380,7 +380,10 @@ import-path segment, e.g. `"commission"` catches `import { commission } from
   regex literals, so a `//` or `/*` inside one (a URL like
   `"https://api.example.com/payout"`, a shell glob like `rm -rf dist/*` in a
   template) isn't mistaken for a comment. It also tells JSX apart from
-  division and regex: a closing tag (`</div>`, `</>`), a self-closing
+  division and regex, but only in files where JSX is plausible: always in
+  `.jsx` and `.tsx`, never in `.ts`, `.mts` and `.cts`, and in any other file
+  (`.js`, `.svelte`, a path with no extension) only after a JSX opener such
+  as `<Foo` or `<>` has been seen: a closing tag (`</div>`, `</>`), a self-closing
   `<Foo a={1} />`, `{a} / {b}` after a JSX expression or object literal, and
   a postfix `i++ / 2` are not regex starts, so a comment after them is
   removed, while a regex after `a</`, a statement block, a prefix `++` or a
@@ -483,16 +486,21 @@ cannot see:
   token. Pass a `RegExp` without a word boundary (e.g. `/payout/i`) if you
   need substring-level matching, or name your real payout fields so they
   appear as their own token somewhere reachable by the grep.
-- Code after a spot where the comment stripper loses track. It is a
-  lexer, not a parser, and it guesses whether a `/` starts a regex literal
-  from the code before it: a regex right after `)` or `]` (such as
-  `if (ok) /[/*]/.test(s)`) is read as division, and a lone backtick in JSX
-  text opens a template literal that never closes. After either, a `/*`
-  can hide the code that follows until the next `*/`. JSX text is not
-  tokenized either, so a `//` inside it (`<p>see https://example.com/payout</p>`)
-  starts a comment that hides the rest of that line. Pass
-  `{ stripComments: false }` for files like that (comments are then scanned
-  too, so a comment that mentions a forbidden word counts).
+- **The comment stripper is a text heuristic, not a parser.** It guesses
+  whether a `/` starts a regex literal or divides from the code before it,
+  and some valid code is ambiguous to a text scanner. A regex literal that
+  contains `/*` or `//`, written right after a token the scanner reads
+  differently, can start a comment that hides code on the same line and
+  until the next `*/`. For example, in `if (ok) /[/*]/.test(s); row.payout;`
+  the `/` after `)` is read as division, so the `/*` inside the regex starts
+  a comment and `row.payout` is not scanned. A `RegExp` identifier does not
+  help here, because comments are stripped before any matcher runs. When you
+  need maximum recall, pass `{ stripComments: false }`: comments are then
+  scanned too, so a comment that mentions a forbidden word counts. Known
+  cases: a regex right after `)` or `]` is read as division, a lone backtick
+  in JSX text opens a template literal that never closes, and JSX text is not
+  tokenized, so a `//` inside it (`<p>see https://example.com/payout</p>`)
+  starts a comment that hides the rest of that line.
 - A line is a line only up to `\n`, `\r\n` or a lone `\r` when the result
   reports line numbers; U+2028 and U+2029 end a `//` comment but do not start
   a new reported line.
