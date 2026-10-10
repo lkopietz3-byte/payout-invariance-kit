@@ -420,23 +420,44 @@ function boxedValue(value: object): unknown {
   return undefined;
 }
 
-function drain(iterator: unknown, next: Intrinsic): unknown[] {
-  const items: unknown[] = [];
+/**
+ * Internal. Append `value` to `array` as an own data property. Plain `push` or
+ * index assignment would run an accessor an outside script put on
+ * `Array.prototype` (a setter that discards writes), and the value would be
+ * lost. Every list this package builds and then reads back to reach a verdict
+ * is built with this, with `ownArray`, or without arrays at all.
+ */
+export function appendOwn<T>(array: T[], value: T): void {
+  Object.defineProperty(array, array.length, { value, writable: true, enumerable: true, configurable: true });
+}
+
+/** An array of `length` own `undefined` elements; assigning to one later cannot reach an inherited setter. */
+function ownArray(length: number): unknown[] {
+  return reflectApply(arrayFrom, Array, [{ length }]) as unknown[];
+}
+
+function drain(iterator: unknown, next: Intrinsic, size: number): unknown[] {
+  const items = ownArray(size);
+  let count = 0;
   for (;;) {
     const step = next(iterator) as IteratorResult<unknown>;
-    if (step.done === true) return items;
-    items.push(step.value);
+    if (step.done === true) break;
+    if (count < size) items[count] = step.value;
+    else appendOwn(items, step.value);
+    count += 1;
   }
+  items.length = count;
+  return items;
 }
 
 /** Internal. A Map's entries, in insertion order. */
 export function mapEntries(value: object): [unknown, unknown][] {
-  return drain(mapEntriesOf(value), mapIteratorNext) as [unknown, unknown][];
+  return drain(mapEntriesOf(value), mapIteratorNext, mapSize(value) as number) as [unknown, unknown][];
 }
 
 /** Internal. A Set's members, in insertion order. */
 export function setValues(value: object): unknown[] {
-  return drain(setValuesOf(value), setIteratorNext);
+  return drain(setValuesOf(value), setIteratorNext, setSize(value) as number);
 }
 
 /** Internal. The bytes of an ArrayBuffer or SharedArrayBuffer (empty once detached). */
@@ -462,7 +483,7 @@ function dataViewBytes(value: object): Uint8Array | undefined {
 export function ownEnumerableKeys(value: object): (string | symbol)[] {
   const keys: (string | symbol)[] = objectKeys(value);
   for (const symbol of objectSymbols(value)) {
-    if (propertyIsEnumerable(value, symbol) === true) keys.push(symbol);
+    if (propertyIsEnumerable(value, symbol) === true) appendOwn(keys, symbol);
   }
   return keys;
 }
@@ -523,9 +544,9 @@ export function denseElements(array: object): unknown[] | undefined {
 export function typedArrayExtraKeys(value: object): (string | symbol)[] {
   const keys = objectKeys(value);
   const extras: (string | symbol)[] = [];
-  for (let index = typedArrayLength(value); index < keys.length; index += 1) extras.push(keys[index] as string);
+  for (let index = typedArrayLength(value); index < keys.length; index += 1) appendOwn(extras, keys[index] as string);
   for (const symbol of objectSymbols(value)) {
-    if (propertyIsEnumerable(value, symbol) === true) extras.push(symbol);
+    if (propertyIsEnumerable(value, symbol) === true) appendOwn(extras, symbol);
   }
   return extras;
 }
@@ -635,7 +656,7 @@ export interface DeepEqualOptions {
  * answer is the same as the key-by-key comparison.
  */
 export function deepEqual(a: unknown, b: unknown, options?: DeepEqualOptions): boolean {
-  return run([a, b], { ordered: readOrderSensitive(options), visited: new WeakMap(), journal: null });
+  return run({ top: pair(a, b, null) }, { ordered: readOrderSensitive(options), visited: new WeakMap(), journal: null });
 }
 
 /** Read `options` once: undefined or a plain object whose `orderSensitive` is a boolean or undefined. */
@@ -655,6 +676,30 @@ export function readOrderSensitive(options: unknown): boolean {
   return value === true;
 }
 
+/** A pair waiting to be compared, linked to the next one. A linked stack never writes an array index. */
+interface Link {
+  a: unknown;
+  b: unknown;
+  next: Link | null;
+}
+
+/** The pairs still to compare (a stack). */
+interface Work {
+  top: Link | null;
+}
+
+/** A pair a trial reached, linked in the order reached. */
+interface Reached {
+  a: object;
+  b: object;
+  next: Reached | null;
+}
+
+interface Journal {
+  head: Reached | null;
+  tail: Reached | null;
+}
+
 interface Context {
   ordered: boolean;
   /**
@@ -664,15 +709,18 @@ interface Context {
    */
   visited: WeakMap<object, WeakSet<object>>;
   /** While trying one candidate match, the pairs it added, so a failed try can undo them. */
-  journal: [object, object][] | null;
+  journal: Journal | null;
 }
 
-/** Compare `[a0, b0, a1, b1, ...]` pair by pair until one pair differs or the work list is empty. */
-function run(work: unknown[], ctx: Context): boolean {
-  while (work.length > 0) {
-    const b = work.pop();
-    const a = work.pop();
-    if (!step(a, b, work, ctx)) return false;
+function pair(a: unknown, b: unknown, next: Link | null): Link {
+  return { a, b, next };
+}
+
+/** Compare pair by pair until one pair differs or the work list is empty. */
+function run(work: Work, ctx: Context): boolean {
+  for (let link = work.top; link !== null; link = work.top) {
+    work.top = link.next;
+    if (!step(link.a, link.b, work, ctx)) return false;
   }
   return true;
 }
@@ -682,29 +730,33 @@ function run(work: unknown[], ctx: Context): boolean {
  * Pairs a failed try reached are forgotten, so a wrong candidate cannot make
  * a later, correct one look equal.
  */
-function trial(pairs: unknown[], ctx: Context): boolean {
+function trial(pairs: Link, ctx: Context): boolean {
   const outer = ctx.journal;
-  const mine: [object, object][] = [];
+  const mine: Journal = { head: null, tail: null };
   ctx.journal = mine;
   let equal: boolean;
   try {
-    equal = run(pairs, ctx);
+    equal = run({ top: pairs }, ctx);
   } finally {
     ctx.journal = outer;
   }
   if (equal) {
-    if (outer !== null) for (const entry of mine) outer.push(entry);
+    if (outer !== null && mine.head !== null && mine.tail !== null) {
+      if (outer.tail === null) outer.head = mine.head;
+      else outer.tail.next = mine.head;
+      outer.tail = mine.tail;
+    }
   } else {
-    for (const [x, y] of mine) ctx.visited.get(x)?.delete(y);
+    for (let entry = mine.head; entry !== null; entry = entry.next) ctx.visited.get(entry.a)?.delete(entry.b);
   }
   return equal;
 }
 
 /** Queue a pair for comparison. False means the pair is already known to differ. */
-function queue(work: unknown[], x: unknown, y: unknown): boolean {
+function queue(work: Work, x: unknown, y: unknown): boolean {
   if (Object.is(x, y)) return true;
   if (typeof x !== "object" || typeof y !== "object" || x === null || y === null) return false;
-  work.push(x, y);
+  work.top = pair(x, y, work.top);
   return true;
 }
 
@@ -718,11 +770,17 @@ function firstVisit(a: object, b: object, ctx: Context): boolean {
     return false;
   }
   partners.add(b);
-  ctx.journal?.push([a, b]);
+  const journal = ctx.journal;
+  if (journal !== null) {
+    const entry: Reached = { a, b, next: null };
+    if (journal.tail === null) journal.head = entry;
+    else journal.tail.next = entry;
+    journal.tail = entry;
+  }
   return true;
 }
 
-function step(a: unknown, b: unknown, work: unknown[], ctx: Context): boolean {
+function step(a: unknown, b: unknown, work: Work, ctx: Context): boolean {
   if (Object.is(a, b)) return true;
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
   const kind = kindOf(a);
@@ -738,7 +796,7 @@ function equalContents(
   a: object,
   b: object,
   kind: Exclude<Kind, "Opaque" | "Array">,
-  work: unknown[],
+  work: Work,
   ctx: Context,
 ): boolean {
   switch (kind) {
@@ -779,7 +837,7 @@ function equalContents(
 }
 
 /** Arrays: same length, then the elements (fast path) or every own key (exact path). */
-function arraysEqual(a: object, b: object, work: unknown[], ctx: Context): boolean {
+function arraysEqual(a: object, b: object, work: Work, ctx: Context): boolean {
   const length = (a as unknown[]).length;
   if (length !== (b as unknown[]).length) return false;
   const elementsA = denseElements(a);
@@ -796,7 +854,7 @@ function arraysEqual(a: object, b: object, work: unknown[], ctx: Context): boole
 }
 
 /** Own enumerable keys and values; typed arrays skip index keys (elements were compared already). */
-function sameOwnProperties(a: object, b: object, typed: boolean, work: unknown[], ctx: Context): boolean {
+function sameOwnProperties(a: object, b: object, typed: boolean, work: Work, ctx: Context): boolean {
   const keysA = typed ? typedArrayExtraKeys(a) : ownEnumerableKeys(a);
   const keysB = typed ? typedArrayExtraKeys(b) : ownEnumerableKeys(b);
   if (keysA.length !== keysB.length) return false;
@@ -812,7 +870,7 @@ function sameOwnProperties(a: object, b: object, typed: boolean, work: unknown[]
   return true;
 }
 
-function sameOptionalOwn(a: object, b: object, key: string, work: unknown[]): boolean {
+function sameOptionalOwn(a: object, b: object, key: string, work: Work): boolean {
   const inA = hasOwnProperty(a, key) === true;
   if (inA !== (hasOwnProperty(b, key) === true)) return false;
   return !inA || queue(work, read(a, key), read(b, key));
@@ -837,7 +895,7 @@ function elementsEqual(a: object, b: object): boolean {
   return true;
 }
 
-function mapsEqual(a: object, b: object, work: unknown[], ctx: Context): boolean {
+function mapsEqual(a: object, b: object, work: Work, ctx: Context): boolean {
   if (mapSize(a) !== mapSize(b)) return false;
   if (ctx.ordered) {
     const entriesB = mapEntries(b);
@@ -855,21 +913,21 @@ function mapsEqual(a: object, b: object, work: unknown[], ctx: Context): boolean
     if (isIdentityKey(key)) {
       if (mapHas(b, key) !== true || !queue(work, value, mapGet(b, key))) return false;
     } else {
-      objectKeyedA.push([key, value]);
+      appendOwn(objectKeyedA, [key, value]);
     }
   }
   const objectKeyedB = mapEntries(b).filter(([key]) => !isIdentityKey(key));
   if (objectKeyedA.length !== objectKeyedB.length) return false;
   // deepEqual is an equivalence relation, so greedy one-to-one matching is exact.
   for (const [keyA, valueA] of objectKeyedA) {
-    const index = objectKeyedB.findIndex(([keyB, valueB]) => trial([keyA, keyB, valueA, valueB], ctx));
+    const index = objectKeyedB.findIndex(([keyB, valueB]) => trial(pair(keyA, keyB, pair(valueA, valueB, null)), ctx));
     if (index === -1) return false;
     objectKeyedB.splice(index, 1);
   }
   return true;
 }
 
-function setsEqual(a: object, b: object, work: unknown[], ctx: Context): boolean {
+function setsEqual(a: object, b: object, work: Work, ctx: Context): boolean {
   if (setSize(a) !== setSize(b)) return false;
   if (ctx.ordered) {
     const membersB = setValues(b);
@@ -885,13 +943,13 @@ function setsEqual(a: object, b: object, work: unknown[], ctx: Context): boolean
     if (isIdentityKey(member)) {
       if (setHas(b, member) !== true) return false;
     } else {
-      objectsA.push(member);
+      appendOwn(objectsA, member);
     }
   }
   const objectsB = setValues(b).filter((member) => !isIdentityKey(member));
   if (objectsA.length !== objectsB.length) return false;
   for (const member of objectsA) {
-    const index = objectsB.findIndex((other) => trial([member, other], ctx));
+    const index = objectsB.findIndex((other) => trial(pair(member, other, null), ctx));
     if (index === -1) return false;
     objectsB.splice(index, 1);
   }

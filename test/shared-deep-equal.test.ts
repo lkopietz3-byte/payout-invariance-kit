@@ -435,3 +435,68 @@ describe("shared snapshot: direct copy checks", { timeout: 180_000 }, () => {
     }
   });
 });
+
+describe("shared comparison: discarding Array.prototype setters", () => {
+  /**
+   * Run `run` with accessors on Array.prototype indexes 0..`count`-1: the setter
+   * discards writes and the getter returns `read()`. Always removed afterwards.
+   */
+  function withPollutedIndexes<T>(count: number, read: () => unknown, run: () => T): T {
+    for (let index = 0; index < count; index += 1) {
+      Object.defineProperty(Array.prototype, index, { get: read, set: () => undefined, configurable: true });
+    }
+    try {
+      return run();
+    } finally {
+      for (let index = 0; index < count; index += 1) {
+        delete (Array.prototype as unknown as Record<number, unknown>)[index];
+      }
+    }
+  }
+
+  it("a discarding setter cannot make the work queue lose nested objects (101 elements)", () => {
+    const make = () => Array.from({ length: 101 }, () => ({ n: 0 }));
+    const left = make();
+    const right = make();
+    right[50]!.n = 1;
+    // the getter returns right[50], the object that differs, for every inherited index
+    const equal = withPollutedIndexes(101, () => right[50], () => deepEqual(left, right));
+    expect(equal).toBe(false);
+  });
+
+  it("the same holds for nested Sets and Maps, ordered and unordered", () => {
+    const make = (n: number) => ({
+      set: new Set(Array.from({ length: 5 }, (_, i) => ({ i, n: i === 3 ? n : 0 }))),
+      map: new Map(Array.from({ length: 5 }, (_, i) => [{ i }, { n: i === 3 ? n : 0 }])),
+    });
+    const left = make(0);
+    const right = make(1);
+    const poisoned = left.set;
+    for (const orderSensitive of [false, true]) {
+      const equal = withPollutedIndexes(6, () => poisoned, () => deepEqual(left, right, { orderSensitive }));
+      expect(equal, `orderSensitive ${String(orderSensitive)}`).toBe(false);
+    }
+    expect(withPollutedIndexes(6, () => poisoned, () => deepEqual(make(0), make(0)))).toBe(true);
+  });
+
+  it("key lists keep a symbol key and a typed array keeps its extra keys", () => {
+    const tag = Symbol("tag");
+    const left = Object.assign({ a: 1 }, { [tag]: 1 });
+    const right = Object.assign({ a: 1 }, { [tag]: 2 });
+    const typedLeft = Object.assign(new Uint8Array(2), { label: "x", [tag]: 1 });
+    const typedRight = Object.assign(new Uint8Array(2), { label: "x", [tag]: 2 });
+    // The getter names a key both sides have, so a lost symbol key would leave equal key lists.
+    const objects = withPollutedIndexes(4, () => "a", () => deepEqual(left, right));
+    const typed = withPollutedIndexes(4, () => "label", () => deepEqual(typedLeft, typedRight));
+    expect([objects, typed]).toEqual([false, false]);
+  });
+
+  it("the copy keeps nested objects when index writes are discarded", () => {
+    const live = { a: { x: 1 }, b: [{ y: 1 }, { y: 2 }], c: new Set([{ z: 1 }]) };
+    const copy = withPollutedIndexes(4, () => undefined, () => snapshot(live));
+    expect(deepEqual(copy, live)).toBe(true);
+    live.b[1]!.y = 3;
+    expect(deepEqual(copy, live)).toBe(false);
+  });
+});
+

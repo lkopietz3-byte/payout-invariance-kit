@@ -25,7 +25,7 @@
  * adapter examples.
  */
 
-import { deepEqual, kindOf, regExpParts } from "./deepEqual.js";
+import { appendOwn, deepEqual, kindOf, regExpParts } from "./deepEqual.js";
 import type { DeepEqualOptions } from "./deepEqual.js";
 import { snapshot } from "./snapshot.js";
 
@@ -223,7 +223,7 @@ function snapshotMutations<TInput>(mutations: unknown): PayoutMutationScenario<T
         `assertPayoutInvariance: mutations[${index}] must be an object with a string "name" and a "mutate" function.`,
       );
     }
-    list.push({ name, mutate: mutate as (baseInput: TInput) => TInput });
+    appendOwn(list, { name, mutate: mutate as (baseInput: TInput) => TInput });
   }
   return list;
 }
@@ -407,7 +407,7 @@ export function assertPayoutInvariance<TInput, TResult>(
     // Precondition guard: a mutation that changed nothing can't prove
     // invariance. Flag it instead of letting it silently count as a pass.
     if (!checkedBoolean("hasChanged", `for ${label}`, hasChanged(baseInput, mutatedInput))) {
-      vacuous.push(name);
+      appendOwn(vacuous, name);
       continue;
     }
 
@@ -424,7 +424,7 @@ export function assertPayoutInvariance<TInput, TResult>(
     }
 
     if (!checkedBoolean("isEqual", `for ${label}`, isEqual(baseline, actual))) {
-      failures.push({ scenario: name, mutatedInput, expected: baseline, actual });
+      appendOwn(failures, { scenario: name, mutatedInput, expected: baseline, actual });
     }
   }
 
@@ -781,7 +781,7 @@ function removeComments(src: string, jsxMode: JsxMode): string {
         lineBreak = false;
         i += 1;
       } else if (ch === "$" && src.charAt(i + 1) === "{") {
-        frames.push({ kind: "expression", braces: 0 });
+        appendOwn(frames, { kind: "expression", braces: 0 });
         out += "${";
         prev = "{";
         prevIndex = -1;
@@ -821,7 +821,7 @@ function removeComments(src: string, jsxMode: JsxMode): string {
       continue;
     }
     if (ch === "`") {
-      frames.push({ kind: "template" });
+      appendOwn(frames, { kind: "template" });
       out += ch;
       i += 1;
       continue;
@@ -850,7 +850,7 @@ function removeComments(src: string, jsxMode: JsxMode): string {
     }
     if (!/\s/.test(ch)) {
       if (ch === "{") {
-        braces.push(opensBlock());
+        appendOwn(braces, opensBlock());
         blockCue = false;
       } else if (ch === "}") {
         closedBlock = braces.pop() ?? true;
@@ -940,7 +940,7 @@ function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { l
           `assertNoPayoutImports: payoutIdentifiers[${index}] is blank (only whitespace or invisible characters).`,
         );
       }
-      matchers.push({ label: trimmed, regex: toMatcher(trimmed, caseInsensitive) });
+      appendOwn(matchers, { label: trimmed, regex: toMatcher(trimmed, caseInsensitive) });
     } else if (typeof identifier === "object" && identifier !== null && kindOf(identifier) === "RegExp") {
       // Read through the RegExp's internal slots, not its own `source`/`flags`.
       // The pattern runs over the whole file (see `findMatches`): `g` makes it
@@ -948,7 +948,7 @@ function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { l
       // a sticky `y` would only match at one position, so it is dropped.
       const { source, flags } = regExpParts(identifier);
       const scanFlags = [...new Set([...flags.replace("y", ""), "g", "m"])].join("");
-      matchers.push({ label: source, regex: new RegExp(source, scanFlags) });
+      appendOwn(matchers, { label: source, regex: new RegExp(source, scanFlags) });
     } else {
       throw new TypeError(`assertNoPayoutImports: payoutIdentifiers[${index}] must be a string or a RegExp.`);
     }
@@ -962,10 +962,10 @@ function splitLines(content: string): { text: string; start: number }[] {
   const terminator = /\r\n|\r|\n/g;
   let start = 0;
   for (let found = terminator.exec(content); found !== null; found = terminator.exec(content)) {
-    lines.push({ text: content.slice(start, found.index), start });
+    appendOwn(lines, { text: content.slice(start, found.index), start });
     start = found.index + found[0].length;
   }
-  lines.push({ text: content.slice(start), start });
+  appendOwn(lines, { text: content.slice(start), start });
   return lines;
 }
 
@@ -990,7 +990,7 @@ function findMatches(content: string, matchers: { label: string; regex: RegExp }
       while (lineIndex + 1 < lines.length && (lines[lineIndex + 1]?.start ?? Infinity) <= hit.index) lineIndex += 1;
       if (lineIndex === reported) continue;
       reported = lineIndex;
-      found.push({
+      appendOwn(found, {
         line: lineIndex + 1,
         order,
         match: { identifier: label, line: lineIndex + 1, text: (lines[lineIndex]?.text ?? "").trim() },
@@ -1019,7 +1019,7 @@ function readSourceFiles(files: unknown): [string, string][] {
       if (typeof path !== "string" || isBlank(path)) {
         throw new TypeError(`assertNoPayoutImports: files[${index}] must be a non-blank path string.`);
       }
-      paths.push(path);
+      appendOwn(paths, path);
     }
     const { readFileSync } = loadNodeFs();
     return paths.map((path) => [path, readFileSync(path, "utf8")]);
@@ -1096,7 +1096,7 @@ export function assertNoPayoutImports(
     const matches = findMatches(content, matchers);
 
     if (matches.length > 0) {
-      offenses.push({ file: path, matches });
+      appendOwn(offenses, { file: path, matches });
     }
   }
 

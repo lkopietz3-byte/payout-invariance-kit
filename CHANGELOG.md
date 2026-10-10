@@ -77,6 +77,13 @@ so the next release should be a minor version. No version bump here.
     that lists its keys out of order is compared by index, and elements are
     copied with `Array.from` so a setter left on `Array.prototype` cannot
     swallow them.
+  - A setter that an outside script left on an `Array.prototype` index can no
+    longer swallow the package's own internal lists. Before this, such a setter
+    could drop a queued comparison and report two different values as equal, or
+    drop an entry in the failure list, the vacuous list or the list of files
+    with offenses, and turn a failing run into a pass. Those lists are now built
+    with own-property appends, and the comparison and copy work stacks are
+    linked lists that never write array indexes.
   - The copy fills Maps and Sets with the real `Map.prototype.set` and
     `Set.prototype.add`, never the input's own overrides, and very wide inputs
     (150,000 elements or named keys) no longer hit the argument limit.

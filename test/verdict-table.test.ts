@@ -483,3 +483,67 @@ describe("verdict table: runtime, self-hunt probes", () => {
   });
 });
 
+describe("verdict table: a discarding Array.prototype setter cannot hide a verdict", () => {
+  /** Accessors on Array.prototype indexes 0..count-1: the setter discards writes. Always removed afterwards. */
+  function polluted<T>(count: number, run: () => T): T {
+    for (let index = 0; index < count; index += 1) {
+      Object.defineProperty(Array.prototype, index, { get: () => undefined, set: () => undefined, configurable: true });
+    }
+    try {
+      return run();
+    } finally {
+      for (let index = 0; index < count; index += 1) {
+        delete (Array.prototype as unknown as Record<number, unknown>)[index];
+      }
+    }
+  }
+
+  const base = { v: 1 };
+
+  it("FAIL: a failing run is still reported as failing, with every failing scenario named", () => {
+    const result = polluted(6, () =>
+      assertPayoutInvariance((input: typeof base) => [input.v], base, [
+        { name: "bumps output", mutate: () => ({ v: 2 }) },
+        { name: "changes nothing", mutate: (input) => ({ ...input }) },
+        { name: "bumps again", mutate: () => ({ v: 3 }) },
+      ]),
+    );
+    expect(result.passed).toBe(false);
+    expect(result.failures.map((failure) => failure.scenario)).toEqual(["bumps output", "bumps again"]);
+    expect(result.vacuous).toEqual(["changes nothing"]);
+  });
+
+  it("PASS: a run that ignores the mutated input still passes", () => {
+    const result = polluted(6, () =>
+      assertPayoutInvariance(() => ["x"], base, [{ name: "bump", mutate: () => ({ v: 2 }) }]),
+    );
+    expect(result.passed).toBe(true);
+  });
+
+  it("FLAG: assertNoPayoutImports still reports every offending file and line", () => {
+    const offenses = polluted(6, () =>
+      assertNoPayoutImports(
+        {
+          "a.ts": "const commission = 1;\nconst y = commission;\n",
+          "b.ts": "const ok = 1;",
+          "c.ts": "// fine\nlet x = commission;\n",
+        },
+        ["commission"],
+      ),
+    );
+    expect(offenses.map((offense) => offense.file)).toEqual(["a.ts", "c.ts"]);
+    expect(offenses[0]?.matches.map((match) => match.line)).toEqual([1, 2]);
+  });
+
+  it("FAIL: an in-place edit of the input is still caught when index writes are discarded", () => {
+    const input = { n: 1, a: { x: 1 }, b: { y: 1 }, c: new Set([{ z: 1 }]) };
+    const edit = (i: typeof input): string[] => {
+      i.b.y = 2;
+      return ["x"];
+    };
+    expect(() => polluted(6, () => assertPayoutInvariance(edit, input, [{ name: "s", mutate: (i) => ({ ...i, n: 2 }) }]))).toThrow(
+      /modified baseInput in place/,
+    );
+  });
+});
+

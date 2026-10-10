@@ -65,12 +65,17 @@ function emptyArguments(): object {
 }
 
 /** A copy that has been created but whose contents are still to be filled in. */
-interface Pending {
+interface Task {
   from: object;
   to: object;
   kind: Kind;
   /** An array copy that already holds the original element values (see `denseElements`). */
   dense: boolean;
+}
+
+/** Copies still to fill, as a linked stack: it never writes an array index. */
+interface Pending {
+  top: { task: Task; next: Pending["top"] } | null;
 }
 
 type Seen = WeakMap<object, unknown>;
@@ -83,9 +88,12 @@ const setAdd = Reflect.get(Set.prototype, "add") as (this: object, ...args: unkn
 
 export function snapshot<T>(value: T): T {
   const seen: Seen = new WeakMap();
-  const pending: Pending[] = [];
+  const pending: Pending = { top: null };
   const root = shell(value, seen, pending);
-  for (let task = pending.pop(); task !== undefined; task = pending.pop()) fill(task, seen, pending);
+  for (let link = pending.top; link !== null; link = pending.top) {
+    pending.top = link.next;
+    fill(link.task, seen, pending);
+  }
   return root as T;
 }
 
@@ -96,7 +104,7 @@ export function snapshot<T>(value: T): T {
  * `seen`) before its children are visited, cycles and shared references
  * resolve to the same copy.
  */
-function shell(value: unknown, seen: Seen, pending: Pending[]): unknown {
+function shell(value: unknown, seen: Seen, pending: Pending): unknown {
   if (typeof value !== "object" || value === null) return value;
   if (seen.has(value)) return seen.get(value);
 
@@ -156,12 +164,12 @@ function shell(value: unknown, seen: Seen, pending: Pending[]): unknown {
   seen.set(value, copy);
   const proto = Object.getPrototypeOf(value) as object | null;
   if (Object.getPrototypeOf(copy) !== proto) Object.setPrototypeOf(copy, proto);
-  pending.push({ from: value, to: copy, kind, dense });
+  pending.top = { task: { from: value, to: copy, kind, dense }, next: pending.top };
   return copy;
 }
 
 /** Fill in a copy's entries, members, elements and own enumerable properties. */
-function fill({ from, to, kind, dense }: Pending, seen: Seen, pending: Pending[]): void {
+function fill({ from, to, kind, dense }: Task, seen: Seen, pending: Pending): void {
   if (kind === "Map") {
     for (const [key, entry] of mapEntries(from)) {
       Reflect.apply(mapSet, to, [shell(key, seen, pending), shell(entry, seen, pending)]);
