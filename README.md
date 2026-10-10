@@ -138,13 +138,27 @@ your result has fields you want to ignore (timestamps, generated ids) or
 need a tolerance. Both `opts.isEqual` and `opts.hasChanged` must return a
 plain boolean.
 
+`opts.orderSensitive` (default `false`) makes the order of a `Map`'s
+entries, a `Set`'s members and an object's keys count. By default the
+comparison ignores that order, so a ranker that returns its ranking as one
+of those types can be reordered by payout without failing the check. **If
+your ranker returns a Map, Set or object in rank order, pass
+`orderSensitive: true` or return an array.** It applies to the default
+comparator, the default `hasChanged` and the in-place-change checks (a
+custom `isEqual` or `hasChanged` decides for itself). Array order always
+counts.
+
+```ts
+assertPayoutInvariance(rank, baseInput, mutations, { orderSensitive: true });
+```
+
 **It throws, instead of returning a misleading result, when the run cannot
 be trusted:**
 
 - `rankFn` is not a function, `mutations` is not a non-empty, dense array of
   `{ name, mutate }` objects (a hole in a sparse array is rejected), or
-  `opts` is not a plain object whose `isEqual`/`hasChanged` are functions —
-  all checked before anything runs. Each scenario's `name` and `mutate` are
+  `opts` is not a plain object whose `isEqual`/`hasChanged` are functions and
+  whose `orderSensitive` is a boolean, all checked before anything runs. Each scenario's `name` and `mutate` are
   read once, and the run uses exactly the scenarios that were checked.
 - `rankFn` or `mutate` throws. The error names the scenario and keeps the
   original error as `cause`. Scenario names and thrown messages are escaped
@@ -157,6 +171,11 @@ be trusted:**
   array). Either would let a real payout dependence hide behind an
   accidental `passed: true`.
 - `opts.isEqual` or `opts.hasChanged` returns anything but a boolean.
+- `rankFn` returns `undefined` on the baseline input. That is almost always
+  a forgotten `return`, and a ranker that always returns `undefined` would
+  pass every scenario. Return the ranking (`[]` for an empty one). `null`
+  and `NaN` are accepted as ordinary values, and an `undefined` on a
+  mutated input is reported as a failure.
 
 **vitest adapter** — the library returns data, so wiring it in is one line:
 
@@ -192,7 +211,8 @@ library's guards where they matter:
 What it does not do: it does not support other result shapes (write a
 projection to an array of strings, or adapt the copy step to your type), it
 does not accept inputs `structuredClone` cannot copy faithfully (class
-instances, functions, Maps with object keys you compare by identity), it
+instances, functions, Maps with object keys you compare by identity; a class
+instance throws a `TypeError` that says so), it
 awaits calls one at a time, and a rejected call propagates as-is without
 naming the scenario. It cannot see side effects outside `baseInput` (a
 cache, a database row).
@@ -215,7 +235,16 @@ async function assertAsyncRankingInvariance<TInput>(
   mutations: PayoutMutationScenario<TInput>[],
 ): Promise<PayoutInvarianceResult<TInput, string[]>> {
   // A copy taken before any call, to catch a ranker that edits baseInput.
+  // structuredClone turns a class instance into a plain object, so a copy
+  // that differs from the original means the input is not plain data and the
+  // in-place check at the end could not be trusted.
   const pristine = structuredClone(baseInput);
+  if (!deepEqual(pristine, baseInput)) {
+    throw new TypeError(
+      "baseInput must be plain data (objects, arrays, strings, numbers, booleans, null). Class instances and " +
+        "Maps with object keys are not supported by this recipe; project the input to plain data first.",
+    );
+  }
 
   // Synchronous pass: assertPayoutInvariance validates the scenarios, runs
   // each mutate once, rejects in-place edits and Promises from mutate, and
@@ -255,10 +284,14 @@ async function assertAsyncRankingInvariance<TInput>(
 README copy matches) against an honest ranker, a payout-sensitive one, one
 that reuses its output array, and ones that edit `baseInput`.
 
-### `deepEqual(a, b)`
+### `deepEqual(a, b, opts?)`
 
 The default comparator, exported so you can reuse it (for example inside
-your own `isEqual`, after projecting away a timestamp). Strict structural
+your own `isEqual`, after projecting away a timestamp). `opts.orderSensitive`
+works as described under `assertPayoutInvariance`: by default the order of a
+`Map`'s entries, a `Set`'s members and an object's own keys is ignored, and
+`{ orderSensitive: true }` makes it count. `opts` must be a plain object
+with a boolean flag, or `deepEqual` throws a `TypeError`. Strict structural
 equality: `Object.is` for primitives (`NaN` equals `NaN`, `0` and `-0`
 differ), same prototype required, own enumerable string and symbol keys
 compared on objects, arrays, `Map`, `Set`, `Date`, `RegExp`, `Error`, boxed
@@ -275,6 +308,8 @@ import { deepEqual } from "payout-invariance-kit";
 
 deepEqual({ ids: ["a", "b"] }, { ids: ["a", "b"] }); // true
 deepEqual(0, -0); // false
+deepEqual(new Set(["a", "b"]), new Set(["b", "a"])); // true (order ignored by default)
+deepEqual(new Set(["a", "b"]), new Set(["b", "a"]), { orderSensitive: true }); // false
 ```
 
 ### `assertNoPayoutImports(files, payoutIdentifiers, opts?)`
@@ -307,16 +342,41 @@ expect(offensesA).toEqual([]);
 Each `payoutIdentifiers` entry is a plain string (matched as a whole word /
 import-path segment, e.g. `"commission"` catches `import { commission } from
 "./payout"` but not a comment mentioning "commission is complicated") or a
-`RegExp` for anything more specific. Line comments and block comments are
-stripped before matching by default (`opts.stripComments`, default `true`),
-so a comment that merely *mentions* a forbidden word doesn't count as a
-reference. The stripper is a small lexer: it skips strings, template
-literals (across lines, including nested `${ }` expressions) and regex
-literals, so a `//` or `/*` inside one (a URL like
-`"https://api.example.com/payout"`, a shell glob like `rm -rf dist/*` in a
-template) isn't mistaken for a comment. A removed block comment leaves a
-space behind, so `return/* note */commission` is still found, and line
-numbers never move.
+`RegExp` for anything more specific.
+
+- **String identifiers** are trimmed (surrounding whitespace and invisible
+  characters are removed; the trimmed text is what the result reports) and
+  matched with Unicode-aware word boundaries: the match must not touch a
+  letter, digit, combining mark or `_` in any script. So `"комиссия"`,
+  `"佣金"` and `"comissão"` are found, `"commission"` is not found inside
+  `"commissionés"`, and an identifier that starts or ends with a symbol
+  (`"$payout"`, `"@payout/core"`, `"rate%"`) is found where it appears. `$`
+  does not count as an identifier character here, so `"payout"` is still
+  found in a Svelte-style `$payout`. No Unicode normalization is applied:
+  an accented word typed as a base letter plus a combining mark does not
+  match its precomposed form, so list both spellings if your code uses both.
+- **`opts.caseInsensitive`** (default `true`) makes string identifiers match
+  regardless of case, in any script. Pass `false` to match case exactly. It
+  does not change `RegExp` entries, which are used as written: give one its
+  own `i` flag if you want it case-insensitive.
+- **`RegExp` entries** run over the whole file, not line by line, so a
+  pattern can span lines (`/import\s*\{[^}]*\bcommission\b/` matches a
+  multi-line import). Each match is reported at the line where it starts, once
+  per line. The scan adds the `g` and `m` flags (so `^` and `$` still mean
+  the start and end of a line) and drops a sticky `y` flag (which would only
+  match at one position).
+- **`opts.stripComments`** (default `true`) removes line comments and block
+  comments before matching, so a comment that merely *mentions* a forbidden
+  word doesn't count as a reference. A line comment ends at `\n`, `\r`,
+  U+2028 or U+2029. The stripper is a small lexer: it skips strings,
+  template literals (across lines, including nested `${ }` expressions) and
+  regex literals, so a `//` or `/*` inside one (a URL like
+  `"https://api.example.com/payout"`, a shell glob like `rm -rf dist/*` in a
+  template) isn't mistaken for a comment. It also tells JSX apart from
+  division and regex: `</div>`, a self-closing `<Foo a={1} />` and `i++ / 2`
+  are not regex starts, so a comment after them is removed. A removed block
+  comment leaves a space behind, so `return/* note */commission` is still
+  found, and line numbers never move.
 
 It throws a `TypeError`, before reading any file, instead of returning a
 clean-looking `[]` for a scan that could not mean anything: an empty `files`
@@ -348,6 +408,13 @@ strong as the scenarios you write, so:
   one at a time.
 - Re-run this whenever the ranking logic changes. It's a regression guard,
   not a one-time certificate — put it in CI.
+- **The default comparison ignores order inside a `Map`, a `Set` and an
+  object's keys.** `new Set(["a", "b"])` equals `new Set(["b", "a"])`, and
+  `{ a: 1, b: 2 }` equals `{ b: 2, a: 1 }`. A ranker that returns its ranking
+  as one of those, in rank order, can be reordered by payout and still pass.
+  If your ranker returns a Map, Set or object in rank order, pass
+  `orderSensitive: true` or return an array. Arrays are always compared in
+  order.
 - `deepEqual` (the default comparator) is strict: `0` and `-0` differ, there
   is no floating-point tolerance, and a class instance never equals a plain
   object with the same fields. Built-ins are recognized by brand checks and
@@ -373,8 +440,10 @@ strong as the scenarios you write, so:
   either.
 - `deepEqual` checks each object's brand once and caches it. The first check
   of an object costs several failed brand checks (about 15 to 25
-  microseconds per object on Node 26 on an Apple-silicon laptop, measured on
-  40,000 fresh objects); later comparisons of the same objects are fast.
+  microseconds of CPU time per object on Node 26 on an Apple-silicon laptop,
+  measured on 40,000 fresh objects on each side); later comparisons of the
+  same objects are fast (about 1 to 2 microseconds per object). Wall-clock
+  time on a busy machine can be many times higher than CPU time.
 - Detecting an in-place edit to `baseInput` or the baseline result has blind
   spots: values kept by reference in the internal snapshot (functions,
   `Error`, boxed primitives, `DataView`, `SharedArrayBuffer`, `Promise`,
@@ -406,12 +475,17 @@ cannot see:
   appear as their own token somewhere reachable by the grep.
 - Code after a spot where the comment stripper loses track. It is a
   lexer, not a parser, and it guesses whether a `/` starts a regex literal
-  from the character before it: a regex right after `)` or `]` (such as
+  from the code before it: a regex right after `)` or `]` (such as
   `if (ok) /[/*]/.test(s)`) is read as division, and a lone backtick in JSX
   text opens a template literal that never closes. After either, a `/*`
-  can hide the code that follows until the next `*/`. Pass
+  can hide the code that follows until the next `*/`. JSX text is not
+  tokenized either, so a `//` inside it (`<p>see https://example.com/payout</p>`)
+  starts a comment that hides the rest of that line. Pass
   `{ stripComments: false }` for files like that (comments are then scanned
   too, so a comment that mentions a forbidden word counts).
+- A line is a line only up to `\n`, `\r\n` or a lone `\r` when the result
+  reports line numbers; U+2028 and U+2029 end a `//` comment but do not start
+  a new reported line.
 
 Both checks are strong signals, not a mathematical guarantee — use them
 together, and combine them with an actual code-review policy for anything

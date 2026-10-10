@@ -68,9 +68,13 @@ has a regression test that failed against the pre-fix commit.
   state kept only in private `#fields`, and one shared `Error`, `DataView`
   or boxed primitive returned and edited on every call.
 - `assertNoPayoutImports`'s comment stripper is a lexer, not a parser: a
-  regex literal right after `)` or `]` is read as division, and a lone
-  backtick in JSX text opens a template that never closes, so either can
-  hide code from the check.
+  regex literal right after `)` or `]` is read as division, a lone
+  backtick in JSX text opens a template that never closes, and JSX text is
+  not tokenized (a `//` in it starts a comment), so any of these can hide
+  code from the check.
+- `deepEqual` ignores `Map` entry order, `Set` member order and object key
+  order by default. `orderSensitive: true` makes them count; the default
+  stays order-insensitive on purpose (README, "Honest limits").
 
 ## Are the types wrong? (attw)
 

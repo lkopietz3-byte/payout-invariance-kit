@@ -4,6 +4,78 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Some inputs that passed or failed before now give a different (correct) answer,
+so the next release should be a minor version. No version bump here.
+
+### Fixed
+
+- `assertNoPayoutImports` matched whole words with ASCII-only `\b`. Identifiers
+  in other scripts (`комиссия`, `佣金`, `προμήθεια`, `comissão`) were never
+  found, ASCII `commission` was found inside `commissionés`, and an identifier
+  starting or ending with a symbol (`$payout`, `@payout/core`, `rate%`) never
+  matched. Matching now uses Unicode-aware boundaries (letters, digits,
+  combining marks and `_` in any script) and only requires a boundary on a side
+  where the identifier itself starts or ends with such a character.
+- A string identifier with surrounding whitespace (`"commission "`) silently
+  matched nothing. It is now trimmed (and a blank one still throws).
+- The comment stripper read a JSX closing tag (`</h2>`) or a self-closing tag
+  (`<Foo a={1} />`) as the start of a regex, so a comment after it
+  (`{/* commission */}`, `; // commission`) was scanned as code. It also read
+  the `/` in `i++ / 2` and `n-- / 2` as a regex start. Both now divide or close
+  a tag, so those comments are removed. Real regexes after a single `+`, `-`,
+  `<` (with a space), `(`, or a `}` on an earlier line are still read as regexes.
+- A `//` comment ended only at `\n`, so code after a `\r`, U+2028 or U+2029 on
+  the same "line" was hidden. It now ends at any JavaScript line terminator.
+  Quoted strings and regex literals also end at a bare `\r`, and a string
+  continued with a backslash and CRLF stays open.
+- A multi-line `RegExp` identifier never matched, because the scan ran line by
+  line, and a sticky `/y` regex never matched. `RegExp` entries now run over the
+  whole file (reported at the line where the match starts, once per line), with
+  `g` and `m` added (so `^` and `$` keep meaning line start and end) and `y`
+  dropped. Line numbers also count a lone `\r` as a line break.
+- The README async recipe reported "rankIds modified baseInput in place" for any
+  class-instance input, because `structuredClone` drops the prototype. It now
+  throws a `TypeError` saying the input must be plain data.
+
+### Changed (behavior)
+
+- New option `orderSensitive` (default `false`) on `assertPayoutInvariance` and
+  on `deepEqual(a, b, opts?)`. When `true`, the order of a `Map`'s entries, a
+  `Set`'s members and an object's own keys is significant, so a ranker that
+  returns its ranking in one of those types and reorders it by payout now fails.
+  The default is unchanged: those three are still compared without regard to
+  order. The option also applies to the default `hasChanged` and the in-place
+  checks. `deepEqual` now throws a `TypeError` if `opts` is not a plain object
+  with a boolean `orderSensitive`.
+- `assertPayoutInvariance` throws a `TypeError` when `rankFn` returns `undefined`
+  on the baseline input (almost always a forgotten `return`; before, a ranker
+  that always returned `undefined` passed). `null` and `NaN` are still accepted.
+- `assertNoPayoutImports` may now report more files (non-Latin identifiers,
+  symbol-edged identifiers, multi-line patterns, code after `\r` or U+2028
+  comment ends) and fewer (ASCII words touching a non-ASCII letter, comments
+  after JSX tags or `++`). `RegExp` entries are scanned across the whole file
+  and `$`/`^` mean line end/start through the added `m` flag.
+
+### Documented
+
+- The default comparison ignores order inside `Map`, `Set` and object keys. It
+  is now stated at the top of "Honest limits" with the guidance to pass
+  `orderSensitive: true` or return an array.
+- `opts.caseInsensitive` (default `true`; applies to string identifiers in any
+  script, not to `RegExp` entries) and the other `assertNoPayoutImports` rules
+  above are in the README.
+- Lexer limits that remain: a regex right after `)` or `]` is read as division,
+  a lone backtick in JSX text opens a template that never closes, and JSX text
+  is not tokenized (a `//` in it starts a comment). No Unicode normalization is
+  applied to identifiers or source. CamelCase and snake_case fragments are
+  still not matched by a string identifier.
+- The `deepEqual` cost note is stated as CPU time, re-measured at 22 to 25
+  microseconds per fresh object (first comparison) and about 1.5 microseconds
+  per object afterwards on Node 26, Apple silicon. Wall-clock time on a busy
+  machine is much higher.
+
 ## [0.2.1] - 2026-10-07
 
 No change to the library's behavior or API.
