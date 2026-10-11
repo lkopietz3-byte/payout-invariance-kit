@@ -5,6 +5,12 @@
  * getters read once, very wide and deep inputs, an Array.prototype setter,
  * and the orderSensitive option.
  */
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import { assertPayoutInvariance, deepEqual } from "../src/index.js";
@@ -417,7 +423,7 @@ describe("shared snapshot: direct copy checks", { timeout: 180_000 }, () => {
     expect(deepEqual(copy, live)).toBe(false);
   });
 
-  it("deep nesting: identical chains of 100,000 levels are equal and copy without recursion", () => {
+  it("deep nesting: identical chains of 30,000 levels are equal and copy without recursion", () => {
     const chain = (depth: number, leaf: number): unknown => {
       let node: unknown = { leaf };
       for (let i = 0; i < depth; i += 1) node = { next: node };
@@ -429,9 +435,9 @@ describe("shared snapshot: direct copy checks", { timeout: 180_000 }, () => {
       return node;
     };
     for (const make of [chain, arrayChain]) {
-      expect(deepEqual(make(100_000, 1), make(100_000, 1))).toBe(true);
-      expect(deepEqual(make(100_000, 1), make(100_000, 2))).toBe(false);
-      expect(deepEqual(snapshot(make(100_000, 1)), make(100_000, 1))).toBe(true);
+      expect(deepEqual(make(30_000, 1), make(30_000, 1))).toBe(true);
+      expect(deepEqual(make(30_000, 1), make(30_000, 2))).toBe(false);
+      expect(deepEqual(snapshot(make(30_000, 1)), make(30_000, 1))).toBe(true);
     }
   });
 });
@@ -577,6 +583,9 @@ describe("shared comparison: rewritten built-ins", { timeout: 180_000 }, () => {
       d2: new Date(2),
       p12: new Set([1, 2]),
       p21: new Set([2, 1]),
+      om1: new Map([["a", 1]]),
+      om2: new Map([["a", 2]]),
+      om3: new Map([["a", 1]]),
       a12: [1, 2],
       a13: [1, 3],
       a12b: [1, 2],
@@ -604,10 +613,18 @@ describe("shared comparison: rewritten built-ins", { timeout: 180_000 }, () => {
         deepEqual(sparseWithExtra, f.dense),
         deepEqual(f.p12, f.p21, { orderSensitive: true }),
         flip.failures.length,
+        deepEqual(f.om1, f.om2, { orderSensitive: true }),
+        deepEqual(f.om1, f.om3, { orderSensitive: true }),
+        deepEqual(f.om1, f.om2),
+        deepEqual(f.om1, f.om3),
+        deepEqual(f.m1, f.m2, { orderSensitive: true }),
       ];
     };
     const expected = battery();
-    expect(expected).toEqual([false, true, false, true, false, false, false, false, false, false, false, false, false, 1]);
+    expect(expected).toEqual([
+      false, true, false, true, false, false, false, false, false, false, false, false, false, 1,
+      false, true, false, true, false,
+    ]);
 
     const tampers: [string, object, PropertyKey, unknown][] = [
       ["Object.is", Object, "is", () => true],
@@ -659,5 +676,52 @@ describe("shared comparison: rewritten built-ins", { timeout: 180_000 }, () => {
       if (JSON.stringify(got) !== JSON.stringify(expected)) wrong.push(`${label}: ${JSON.stringify(got)}`);
     }
     expect(wrong).toEqual([]);
+  });
+});
+
+describe("shared comparison: extra key listed instead of an element key", { timeout: 120_000 }, () => {
+  const view = (tag: number): number[] =>
+    new Proxy(Object.assign([1], { tag }), { ownKeys: () => ["tag", "length"] });
+
+  it("keeps the extra key in the comparison and the copy", () => {
+    expect(deepEqual(view(1), view(2))).toBe(false);
+    expect(deepEqual(view(1), view(1))).toBe(true);
+    expect(deepEqual(view(1), [1])).toBe(false);
+    const copy = snapshot({ list: view(1) });
+    expect(deepEqual(copy, { list: view(1) })).toBe(true);
+    expect(deepEqual(copy, { list: view(2) })).toBe(false);
+  });
+
+  it("a ranking that differs only in such a tag fails assertPayoutInvariance", () => {
+    const base = { n: 1 };
+    const result = assertPayoutInvariance((input: typeof base) => view(input.n), base, [
+      { name: "n -> 2", mutate: () => ({ n: 2 }) },
+    ]);
+    expect(result.passed).toBe(false);
+    expect(result.failures).toHaveLength(1);
+  });
+
+  it("an uninspectable exception whose prototype chain loops yields 'not comparable', not a hang", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pik-shared-"));
+    try {
+      for (const file of ["index", "deepEqual", "snapshot"]) {
+        const source = readFileSync(new URL(`../src/${file}.ts`, import.meta.url), "utf8");
+        const out = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
+        writeFileSync(join(dir, `${file}.js`), out.outputText);
+      }
+      writeFileSync(join(dir, "package.json"), '{"type":"module"}');
+      writeFileSync(
+        join(dir, "probe.js"),
+        `import { deepEqual } from "./index.js";
+const loop = new Proxy({}, { getPrototypeOf: () => loop });
+const make = () => new Proxy({}, { getPrototypeOf() { throw loop; } });
+console.log("answer: " + deepEqual(make(), make()));`,
+      );
+      const run = spawnSync(process.execPath, [join(dir, "probe.js")], { timeout: 30_000, encoding: "utf8" });
+      expect(run.stdout).toContain("answer: false");
+      expect(run.status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -84,6 +84,13 @@ so the next release should be a minor version. No version bump here.
     with offenses, and turn a failing run into a pass. Those lists are now built
     with own-property appends, and the comparison and copy work stacks are
     linked lists that never write array indexes.
+  - Three more comparison fixes from review. An array Proxy that lists an extra
+    key in place of an element key (`ownKeys` returning `["tag", "length"]` for
+    a one-element array) is no longer treated as a plain dense array, so a
+    difference in that key is found in both the comparison and the copy. Map
+    entries are read by index. The walk up the prototype chain of an
+    uninspectable exception is bounded, so a looping chain gives "not
+    comparable" instead of a hang.
   - The comparison, the copy and the `assertPayoutInvariance` run loop no longer
     look built-ins up while they work. They use copies saved at import and
     avoid `for...of`, spread and `Array.prototype` methods, so an empty

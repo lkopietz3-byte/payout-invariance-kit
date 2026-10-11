@@ -431,7 +431,11 @@ function classify(value: object): Kind {
 export function isRangeError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   try {
+    let depth = 0;
     for (let proto = getPrototypeOf(error) as object | null; proto !== null; proto = getPrototypeOf(proto) as object | null) {
+      // A Proxy can report itself as its own prototype: stop at the same depth limit the classifier uses.
+      depth += 1;
+      if (depth > MAX_PROTOTYPE_CHAIN) return false;
       if (proto === rangeErrorPrototype) return true;
     }
   } catch {
@@ -605,16 +609,20 @@ function hasEnumerableSymbol(value: object): boolean {
  * (a hole, a non-enumerable element, an extra key) returns undefined, having
  * run no getter, and the caller takes the exact key-by-key path.
  *
- * `Object.keys` counts the enumerable string keys without reading any value.
+ * `Object.keys` lists the enumerable string keys without reading any value.
  * A count equal to the length is not enough on its own (a hole and an extra
- * key cancel out), so every index is also confirmed: by the key list itself
- * when it is in the usual order, otherwise one `propertyIsEnumerable` check
- * per index. A "clean" answer is exact.
+ * key cancel out), so the listed keys themselves are checked to be exactly
+ * "0" to "length - 1". A "clean" answer is exact.
  */
 export function denseElements(array: object): unknown[] | undefined {
   const length = (array as unknown[]).length;
   const keys = objectKeys(array);
   if (keys.length !== length) return undefined;
+  // The listed keys must be exactly the indices 0..length-1. Usually they are
+  // listed in order, which one pass confirms. A Proxy may list them in another
+  // order, or leave out an element and list an extra key in its place (same
+  // count): then each listed key must be one of the expected index strings
+  // (the keys of a Proxy's ownKeys are distinct, so equal counts make that exact).
   let inOrder = true;
   for (let index = 0; index < length; index += 1) {
     if (keys[index] !== `${index}`) {
@@ -623,8 +631,10 @@ export function denseElements(array: object): unknown[] | undefined {
     }
   }
   if (!inOrder) {
+    const expected = objectCreate(null) as Record<string, true | undefined>;
+    for (let index = 0; index < length; index += 1) expected[`${index}`] = true;
     for (let index = 0; index < length; index += 1) {
-      if (propertyIsEnumerable(array, index) !== true) return undefined;
+      if (expected[keys[index] as string] !== true) return undefined;
     }
   }
   if (hasEnumerableSymbol(array)) return undefined;
@@ -1011,20 +1021,20 @@ function mapsEqual(a: object, b: object, work: Work, ctx: Context): boolean {
     const entriesA = mapEntries(a);
     if (entriesA.length !== entriesB.length) return false;
     for (let index = 0; index < entriesA.length; index += 1) {
-      const [keyA, valueA] = entriesA[index] as [unknown, unknown];
-      const [keyB, valueB] = entriesB[index] as [unknown, unknown];
-      if (!queue(work, keyA, keyB) || !queue(work, valueA, valueB)) return false;
+      const entryA = entriesA[index] as [unknown, unknown];
+      const entryB = entriesB[index] as [unknown, unknown];
+      if (!queue(work, entryA[0], entryB[0]) || !queue(work, entryA[1], entryB[1])) return false;
     }
     return true;
   }
   const entriesA = mapEntries(a);
   const objectKeyedA: [unknown, unknown][] = [];
   for (let index = 0; index < entriesA.length; index += 1) {
-    const [key, value] = entriesA[index] as [unknown, unknown];
-    if (isIdentityKey(key)) {
-      if (mapHas(b, key) !== true || !queue(work, value, mapGet(b, key))) return false;
+    const entry = entriesA[index] as [unknown, unknown];
+    if (isIdentityKey(entry[0])) {
+      if (mapHas(b, entry[0]) !== true || !queue(work, entry[1], mapGet(b, entry[0]))) return false;
     } else {
-      appendOwn(objectKeyedA, [key, value]);
+      appendOwn(objectKeyedA, entry);
     }
   }
   const entriesB = mapEntries(b);
@@ -1036,12 +1046,12 @@ function mapsEqual(a: object, b: object, work: Work, ctx: Context): boolean {
   if (objectKeyedA.length !== objectKeyedB.length) return false;
   // deepEqual is an equivalence relation, so greedy one-to-one matching is exact.
   for (let indexA = 0; indexA < objectKeyedA.length; indexA += 1) {
-    const [keyA, valueA] = objectKeyedA[indexA] as [unknown, unknown];
+    const entryA = objectKeyedA[indexA] as [unknown, unknown];
     let matched = false;
     for (let indexB = 0; indexB < objectKeyedB.length; indexB += 1) {
       const candidate = objectKeyedB[indexB];
       if (candidate === undefined) continue;
-      if (trial(pair(keyA, candidate[0], pair(valueA, candidate[1], null)), ctx)) {
+      if (trial(pair(entryA[0], candidate[0], pair(entryA[1], candidate[1], null)), ctx)) {
         objectKeyedB[indexB] = undefined;
         matched = true;
         break;
