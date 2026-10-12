@@ -22,32 +22,60 @@
  *
  * Property keys are written with `Object.defineProperty`, never by
  * assignment, so an own `__proto__` key (from `JSON.parse`) is copied as a
- * plain property and cannot change the copy's prototype.
+ * plain property and cannot change the copy's prototype. The one exception is
+ * the element fast path for arrays with no hole and no extra key: the copy
+ * starts as a fresh array of the element values, and an element that is an
+ * object is replaced by its copy with a plain assignment to that existing
+ * element.
+ *
+ * Copying uses an explicit work list, not recursion, so nesting depth is
+ * limited by memory and not by the call stack.
  */
 import {
   bufferBytes,
   copyTypedArrayInto,
   dateValue,
-  isIndexKey,
+  denseElements,
   kindOf,
   mapEntries,
   ownEnumerableKeys,
   regExpParts,
   registerBrand,
   setValues,
+  weakMapGet,
+  weakMapSet,
   TYPED_ARRAY_NAMES,
+  typedArrayExtraKeys,
   typedArrayLength,
   typedArrayName,
 } from "./deepEqual.js";
+import type { Kind } from "./deepEqual.js";
 
 type TypedArrayConstructor = new (length: number) => object;
 
 /** Every typed array constructor this runtime has, by the name its brand reports. */
-const typedArrayConstructors = new Map<string, TypedArrayConstructor>();
+const typedArrayConstructors = Object.create(null) as Record<string, TypedArrayConstructor | undefined>;
 for (const name of TYPED_ARRAY_NAMES) {
   const candidate: unknown = Reflect.get(globalThis, name);
-  if (typeof candidate === "function") typedArrayConstructors.set(name, candidate as TypedArrayConstructor);
+  if (typeof candidate === "function") typedArrayConstructors[name] = candidate as TypedArrayConstructor;
 }
+
+// Built-ins this file calls while copying, captured once at import (see the
+// "Built-ins and tampering" note in README.md, Honest limits).
+const objectCreate = Object.create;
+const getPrototypeOf = Object.getPrototypeOf;
+const setPrototypeOf = Object.setPrototypeOf;
+const defineProperty = Object.defineProperty;
+const reflectGet = Reflect.get;
+const WeakMapConstructor = WeakMap;
+const Uint8ArrayConstructor = Uint8Array;
+const reflectApply = Reflect.apply;
+const ArrayConstructor = Array;
+const DateConstructor = Date;
+const RegExpConstructor = RegExp;
+const MapConstructor = Map;
+const SetConstructor = Set;
+const ArrayBufferConstructor = ArrayBuffer;
 
 /** A fresh, empty `arguments` object (this module is strict, so it is unmapped). */
 function emptyArguments(): object {
@@ -55,72 +83,93 @@ function emptyArguments(): object {
   return (function () { return arguments; })();
 }
 
+/** A copy that has been created but whose contents are still to be filled in. */
+interface Task {
+  from: object;
+  to: object;
+  kind: Kind;
+  /** An array copy that already holds the original element values (see `denseElements`). */
+  dense: boolean;
+}
+
+/** Copies still to fill, as a linked stack: it never writes an array index. */
+interface Pending {
+  top: { task: Task; next: Pending["top"] } | null;
+}
+
+type Seen = WeakMap<object, unknown>;
+
+// Captured now: a copy is filled with the real Map/Set operations, so a null
+// or replaced prototype, or a subclass override, cannot break or run during
+// the copy.
+const mapSet = Reflect.get(Map.prototype, "set") as (this: object, ...args: unknown[]) => unknown;
+const setAdd = Reflect.get(Set.prototype, "add") as (this: object, ...args: unknown[]) => unknown;
+
 export function snapshot<T>(value: T): T {
-  return clone(value, new WeakMap()) as T;
-}
-
-function copyOwnProperties(from: object, to: object, skipIndexKeys: boolean, seen: WeakMap<object, unknown>): void {
-  for (const key of ownEnumerableKeys(from)) {
-    if (skipIndexKeys && isIndexKey(key)) continue;
-    Object.defineProperty(to, key, {
-      value: clone(Reflect.get(from, key) as unknown, seen),
-      enumerable: true,
-      writable: true,
-      configurable: true,
-    });
+  const seen: Seen = new WeakMapConstructor();
+  const pending: Pending = { top: null };
+  const root = shell(value, seen, pending);
+  for (let link = pending.top; link !== null; link = pending.top) {
+    pending.top = link.next;
+    fill(link.task, seen, pending);
   }
+  return root as T;
 }
 
-function clone(value: unknown, seen: WeakMap<object, unknown>): unknown {
+/**
+ * The copy of `value`: itself for a primitive or a value kept by reference,
+ * otherwise a new object with its built-in content already in place and the
+ * rest queued in `pending`. Because the copy exists (and is registered in
+ * `seen`) before its children are visited, cycles and shared references
+ * resolve to the same copy.
+ */
+function shell(value: unknown, seen: Seen, pending: Pending): unknown {
   if (typeof value !== "object" || value === null) return value;
-  if (seen.has(value)) return seen.get(value);
+  const known = weakMapGet(seen, value);
+  if (known !== undefined) return known;
 
   const kind = kindOf(value);
   let copy: object;
+  let dense = false;
 
   switch (kind) {
     case "Object":
-      copy = Object.create(Object.getPrototypeOf(value) as object | null) as object;
+      copy = objectCreate(getPrototypeOf(value) as object | null) as object;
       break;
     case "Arguments":
       copy = emptyArguments();
       break;
-    case "Array":
-      copy = new Array<unknown>((value as unknown[]).length);
+    case "Array": {
+      const elements = denseElements(value);
+      dense = elements !== undefined;
+      copy = elements ?? new ArrayConstructor<unknown>((value as unknown[]).length);
       break;
+    }
     case "Date":
-      copy = new Date(dateValue(value));
+      copy = new DateConstructor(dateValue(value));
       break;
     case "RegExp": {
       const { source, flags, lastIndex } = regExpParts(value);
-      const regexp = new RegExp(source, flags);
-      Object.defineProperty(regexp, "lastIndex", { value: lastIndex });
+      const regexp = new RegExpConstructor(source, flags);
+      defineProperty(regexp, "lastIndex", { value: lastIndex });
       copy = regexp;
       break;
     }
-    case "Map": {
-      const map = new Map<unknown, unknown>();
-      seen.set(value, map);
-      for (const [key, entry] of mapEntries(value)) map.set(clone(key, seen), clone(entry, seen));
-      copy = map;
+    case "Map":
+      copy = new MapConstructor<unknown, unknown>();
       break;
-    }
-    case "Set": {
-      const set = new Set<unknown>();
-      seen.set(value, set);
-      for (const member of setValues(value)) set.add(clone(member, seen));
-      copy = set;
+    case "Set":
+      copy = new SetConstructor<unknown>();
       break;
-    }
     case "ArrayBuffer": {
       const bytes = bufferBytes(value, kind);
-      const buffer = new ArrayBuffer(bytes.length);
-      new Uint8Array(buffer).set(bytes);
+      const buffer = new ArrayBufferConstructor(bytes.length);
+      if (bytes.length > 0) copyTypedArrayInto(new Uint8ArrayConstructor(buffer), bytes);
       copy = buffer;
       break;
     }
     case "TypedArray": {
-      const Typed = typedArrayConstructors.get(typedArrayName(value));
+      const Typed = typedArrayConstructors[typedArrayName(value)];
       if (!Typed) return value; // an element type this runtime cannot construct: keep by reference
       const length = typedArrayLength(value);
       copy = new Typed(length);
@@ -132,9 +181,47 @@ function clone(value: unknown, seen: WeakMap<object, unknown>): unknown {
   }
 
   registerBrand(copy, kind);
-  seen.set(value, copy);
-  const proto = Object.getPrototypeOf(value) as object | null;
-  if (Object.getPrototypeOf(copy) !== proto) Object.setPrototypeOf(copy, proto);
-  copyOwnProperties(value, copy, kind === "TypedArray", seen);
+  weakMapSet(seen, value, copy);
+  const proto = getPrototypeOf(value) as object | null;
+  if (getPrototypeOf(copy) !== proto) setPrototypeOf(copy, proto);
+  pending.top = { task: { from: value, to: copy, kind, dense }, next: pending.top };
   return copy;
+}
+
+/** Fill in a copy's entries, members, elements and own enumerable properties. */
+function fill({ from, to, kind, dense }: Task, seen: Seen, pending: Pending): void {
+  if (kind === "Map") {
+    const entries = mapEntries(from);
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index] as [unknown, unknown];
+      reflectApply(mapSet, to, [shell(entry[0], seen, pending), shell(entry[1], seen, pending)]);
+    }
+  } else if (kind === "Set") {
+    const members = setValues(from);
+    for (let index = 0; index < members.length; index += 1) {
+      reflectApply(setAdd, to, [shell(members[index], seen, pending)]);
+    }
+  }
+
+  if (dense) {
+    // `to` holds the element values; own data elements of a fresh array, so
+    // plain assignment cannot reach a setter.
+    const elements = to as unknown[];
+    for (let index = 0; index < elements.length; index += 1) {
+      const element = elements[index];
+      if (typeof element === "object" && element !== null) elements[index] = shell(element, seen, pending);
+    }
+    return;
+  }
+
+  const keys = kind === "TypedArray" ? typedArrayExtraKeys(from) : ownEnumerableKeys(from);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index] as string | symbol;
+    defineProperty(to, key, {
+      value: shell(reflectGet(from, key) as unknown, seen, pending),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
 }

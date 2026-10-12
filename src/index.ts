@@ -25,10 +25,24 @@
  * adapter examples.
  */
 
-import { deepEqual, kindOf, regExpParts } from "./deepEqual.js";
+import { appendOwn, deepEqual, kindOf, regExpParts } from "./deepEqual.js";
+import type { DeepEqualOptions } from "./deepEqual.js";
 import { snapshot } from "./snapshot.js";
 
 export { deepEqual };
+export type { DeepEqualOptions };
+
+// Built-ins the runtime check calls on the way to a verdict, captured once at
+// import (README, Honest limits, "Built-ins and tampering"). The static scanner
+// further down is a text tool and is out of scope for that limit.
+const reflectGet = Reflect.get;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const isArray = Array.isArray;
+// eslint-disable-next-line @typescript-eslint/unbound-method -- saved on purpose, called through call.bind
+const callHasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty) as (
+  object: object,
+  key: PropertyKey,
+) => boolean;
 
 // ---------------------------------------------------------------------------
 // 1. assertPayoutInvariance — runtime invariance under payout mutation.
@@ -85,6 +99,18 @@ export interface AssertPayoutInvarianceOptions<TInput, TResult> {
    * `assertPayoutInvariance` throw.
    */
   hasChanged?: (baseInput: TInput, mutatedInput: TInput) => boolean;
+  /**
+   * Make the order of a `Map`'s entries, a `Set`'s members and an object's
+   * own enumerable keys significant. Defaults to false: those three are
+   * compared without regard to order, so a ranker that returns its ranking
+   * as a `Set`, a `Map` or a keyed object can reorder it without failing the
+   * check. If your ranker returns one of those in rank order, pass
+   * `orderSensitive: true` or return an array (array order always matters).
+   * Applies to the default `isEqual`, the default `hasChanged` and the
+   * in-place-change checks; a custom `isEqual` or `hasChanged` decides for
+   * itself. Must be a boolean when given.
+   */
+  orderSensitive?: boolean;
 }
 
 /** One scenario whose ranking result differed from the baseline. */
@@ -162,12 +188,12 @@ function describeError(error: unknown): string {
   }
 }
 
-const hasOwn = (object: object, key: PropertyKey): boolean => Object.prototype.hasOwnProperty.call(object, key);
+const hasOwn = (object: object, key: PropertyKey): boolean => callHasOwn(object, key);
 
 /** Only a plain `{}` or `Object.create(null)` object counts as an options or content record. */
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || kindOf(value) !== "Object") return false;
-  const proto = Object.getPrototypeOf(value) as unknown;
+  const proto = objectGetPrototypeOf(value) as unknown;
   return proto === Object.prototype || proto === null;
 }
 
@@ -184,7 +210,7 @@ function isBlank(text: string): boolean {
  * scenario's getters do later.
  */
 function snapshotMutations<TInput>(mutations: unknown): PayoutMutationScenario<TInput>[] {
-  if (!Array.isArray(mutations)) {
+  if (!isArray(mutations)) {
     throw new TypeError("assertPayoutInvariance: mutations must be an array of { name, mutate } objects.");
   }
   const length = mutations.length;
@@ -201,15 +227,15 @@ function snapshotMutations<TInput>(mutations: unknown): PayoutMutationScenario<T
       );
     }
     const candidate: unknown = mutations[index];
-    const name: unknown = typeof candidate === "object" && candidate !== null ? Reflect.get(candidate, "name") : undefined;
+    const name: unknown = typeof candidate === "object" && candidate !== null ? reflectGet(candidate, "name") : undefined;
     const mutate: unknown =
-      typeof candidate === "object" && candidate !== null ? Reflect.get(candidate, "mutate") : undefined;
+      typeof candidate === "object" && candidate !== null ? reflectGet(candidate, "mutate") : undefined;
     if (typeof name !== "string" || typeof mutate !== "function") {
       throw new TypeError(
         `assertPayoutInvariance: mutations[${index}] must be an object with a string "name" and a "mutate" function.`,
       );
     }
-    list.push({ name, mutate: mutate as (baseInput: TInput) => TInput });
+    appendOwn(list, { name, mutate: mutate as (baseInput: TInput) => TInput });
   }
   return list;
 }
@@ -217,22 +243,24 @@ function snapshotMutations<TInput>(mutations: unknown): PayoutMutationScenario<T
 type Hook = ((...args: never[]) => unknown) | undefined;
 
 /** Read `opts` once: undefined or a plain object whose hooks are functions or undefined. */
-function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook } {
-  if (opts === undefined) return { isEqual: undefined, hasChanged: undefined };
+function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook; orderSensitive: boolean } {
+  if (opts === undefined) return { isEqual: undefined, hasChanged: undefined, orderSensitive: false };
   if (!isPlainRecord(opts)) {
     throw new TypeError("assertPayoutInvariance: opts must be a plain object (or omitted).");
   }
   const isEqual = opts.isEqual;
   const hasChanged = opts.hasChanged;
-  for (const [hook, value] of [
-    ["isEqual", isEqual],
-    ["hasChanged", hasChanged],
-  ] as const) {
-    if (value !== undefined && typeof value !== "function") {
-      throw new TypeError(`assertPayoutInvariance: opts.${hook} must be a function (or omitted).`);
-    }
+  if (isEqual !== undefined && typeof isEqual !== "function") {
+    throw new TypeError("assertPayoutInvariance: opts.isEqual must be a function (or omitted).");
   }
-  return { isEqual: isEqual as Hook, hasChanged: hasChanged as Hook };
+  if (hasChanged !== undefined && typeof hasChanged !== "function") {
+    throw new TypeError("assertPayoutInvariance: opts.hasChanged must be a function (or omitted).");
+  }
+  const orderSensitive = opts.orderSensitive;
+  if (orderSensitive !== undefined && typeof orderSensitive !== "boolean") {
+    throw new TypeError("assertPayoutInvariance: opts.orderSensitive must be a boolean (or omitted).");
+  }
+  return { isEqual: isEqual as Hook, hasChanged: hasChanged as Hook, orderSensitive: orderSensitive === true };
 }
 
 /**
@@ -277,6 +305,13 @@ function readRuntimeOptions(opts: unknown): { isEqual: Hook; hasChanged: Hook } 
  *   whether payout actually changed the ranking.
  * - `isEqual` or `hasChanged` returns anything but a boolean (for example a
  *   Promise, which is always truthy and would make every scenario "pass").
+ * - `rankFn` returns `undefined` on the baseline input (almost always a
+ *   forgotten `return`). `null` and `NaN` are accepted as ordinary values; a
+ *   later call that returns `undefined` is reported as a failure.
+ *
+ * The default comparison ignores the order of a `Map`'s entries, a `Set`'s
+ * members and an object's keys. If the ranker returns one of those in rank
+ * order, pass `{ orderSensitive: true }` or return an array.
  */
 export function assertPayoutInvariance<TInput, TResult>(
   rankFn: (input: TInput) => TResult,
@@ -289,14 +324,15 @@ export function assertPayoutInvariance<TInput, TResult>(
   }
   const list = snapshotMutations<TInput>(mutations);
   const options = readRuntimeOptions(opts);
-  const isEqual = (options.isEqual as ((expected: TResult, actual: TResult) => unknown) | undefined) ?? deepEqual;
+  const sameValue = (x: unknown, y: unknown): boolean => deepEqual(x, y, { orderSensitive: options.orderSensitive });
+  const isEqual = (options.isEqual as ((expected: TResult, actual: TResult) => unknown) | undefined) ?? sameValue;
   const hasChanged =
     (options.hasChanged as ((base: TInput, mutated: TInput) => unknown) | undefined) ??
-    ((base: TInput, mutated: TInput) => !deepEqual(base, mutated));
+    ((base: TInput, mutated: TInput) => !sameValue(base, mutated));
 
   const pristineInput = snapshot(baseInput);
   const assertBaseUntouched = (who: string): void => {
-    if (!deepEqual(pristineInput, baseInput)) {
+    if (!sameValue(pristineInput, baseInput)) {
       throw new Error(
         `assertPayoutInvariance: ${who} modified baseInput in place. Neither rankFn nor mutate may change ` +
           `their argument (copy before sorting or editing); every scenario starts from the same baseInput, ` +
@@ -343,6 +379,13 @@ export function assertPayoutInvariance<TInput, TResult>(
   };
 
   const baseline = callRankFn(baseInput, "on the baseline input");
+  if (baseline === undefined) {
+    throw new TypeError(
+      "assertPayoutInvariance: rankFn returned undefined on the baseline input. That is almost always a " +
+        "forgotten `return`, and a ranker that always returns undefined would pass every scenario. Return " +
+        "the ranking (an empty array for an empty ranking).",
+    );
+  }
   assertBaseUntouched("rankFn (on the baseline input)");
   // rankFn may return an object it later reuses (a buffer it clears and
   // refills). If a later call rewrote the baseline result in place, baseline
@@ -353,7 +396,8 @@ export function assertPayoutInvariance<TInput, TResult>(
   const failures: PayoutInvarianceFailure<TInput, TResult>[] = [];
   const vacuous: string[] = [];
 
-  for (const { name, mutate } of list) {
+  for (let position = 0; position < list.length; position += 1) {
+    const { name, mutate } = list[position] as PayoutMutationScenario<TInput>;
     const label = `scenario ${quote(name)}`;
     let mutatedInput: TInput;
     try {
@@ -374,7 +418,7 @@ export function assertPayoutInvariance<TInput, TResult>(
     // Precondition guard: a mutation that changed nothing can't prove
     // invariance. Flag it instead of letting it silently count as a pass.
     if (!checkedBoolean("hasChanged", `for ${label}`, hasChanged(baseInput, mutatedInput))) {
-      vacuous.push(name);
+      appendOwn(vacuous, name);
       continue;
     }
 
@@ -383,7 +427,7 @@ export function assertPayoutInvariance<TInput, TResult>(
       `on the mutated input for ${label} (it did not throw on the baseline input)`,
     );
     assertBaseUntouched(`${label}: rankFn`);
-    if (!deepEqual(baselineCopy, baseline)) {
+    if (!sameValue(baselineCopy, baseline)) {
       throw new Error(
         `assertPayoutInvariance: rankFn modified its earlier (baseline) result in place during ${label}. ` +
           `Return a fresh value from every call, or the baseline can no longer be compared.`,
@@ -391,7 +435,7 @@ export function assertPayoutInvariance<TInput, TResult>(
     }
 
     if (!checkedBoolean("isEqual", `for ${label}`, isEqual(baseline, actual))) {
-      failures.push({ scenario: name, mutatedInput, expected: baseline, actual });
+      appendOwn(failures, { scenario: name, mutatedInput, expected: baseline, actual });
     }
   }
 
@@ -427,21 +471,38 @@ export interface AssertNoPayoutImportsOptions {
    * literals (across lines, including nested `${ }` expressions) and regex
    * literals are skipped, so a `//` or `/*` inside one (e.g.
    * `"https://example.com/payout"`, or `rm -rf dist/*` in a template) is not
-   * mistaken for a comment. This is a small lexer, not a parser — see
-   * README.md "Honest limits": a regex literal right after `)` or `]` is
-   * read as division, and a lone backtick in JSX text opens a template that
-   * never closes; after either, a `/*` can hide the code that follows. Pass
-   * `false` for files like that. Must be a boolean when given. Defaults to
-   * true.
+   * mistaken for a comment. A `//` comment ends at `\n`, `\r`, U+2028 or
+   * U+2029. JSX closing and self-closing tags and `i++ / 2` are not read as
+   * regex starts. This is a small lexer, not a parser; see README.md "Honest
+   * limits": a regex literal right after `)` or `]` is read as division, a
+   * lone backtick in JSX text opens a template that never closes, and JSX
+   * text is not tokenized; after any of these, a `/*` or `//` can hide the
+   * code that follows. Pass `false` for files like that. Must be a boolean
+   * when given. Defaults to true.
    */
   stripComments?: boolean;
   /**
-   * Case-insensitive matching for string identifiers (RegExp patterns are
-   * used as-is; give them their own `i` flag if you want that). Defaults to
-   * true, since missing a reference due to casing is worse than an
-   * occasional over-match. Must be a boolean when given.
+   * Case-insensitive matching for string identifiers, in any script (RegExp
+   * patterns are used as written; give them their own `i` flag if you want
+   * that). Defaults to true, since missing a reference due to casing is
+   * worse than an occasional over-match. Must be a boolean when given.
    */
   caseInsensitive?: boolean;
+  /**
+   * Match a string identifier as one part of a longer identifier, not only as
+   * a whole word. `"affiliate"` is then found in `affiliateUrl`,
+   * `getAffiliate`, `affiliate_url`, `AFFILIATE_URL`, `PayoutRate`,
+   * `XMLAffiliate` and `payout2`, but still not in `affiliates`, `affiliated`
+   * or `prepayout`. Parts are split at `_`, at a lower-to-upper case change
+   * (`affiliateUrl`), at the end of an acronym (`XMLHttp`), and between letters
+   * and digits; `-`, `.`, `/` and other symbols already separate words.
+   * Letters of one case with no separator (`affiliateurl`, `AFFILIATEURL`)
+   * are a single part. Applies to string identifiers only (RegExp entries are
+   * used as written). With `caseInsensitive: false`, write the identifier in
+   * the case the code uses. Defaults to false, so existing scans keep their
+   * results. Must be a boolean when given.
+   */
+  matchIdentifierParts?: boolean;
 }
 
 /** One scanned file that references a forbidden identifier, with every matching line. */
@@ -455,23 +516,156 @@ export interface PayoutImportOffense {
 const DEFAULT_OPTIONS: Required<AssertNoPayoutImportsOptions> = {
   stripComments: true,
   caseInsensitive: true,
+  matchIdentifierParts: false,
 };
+
+/** One compiled identifier: a search regex, plus an optional check on each candidate it finds. */
+interface Matcher {
+  label: string;
+  regex: RegExp;
+  /** When present, a candidate in `[start, end)` counts only if this returns true. */
+  accepts?: (content: string, start: number, end: number) => boolean;
+  /** With `accepts`: where to resume the search after a rejected candidate that started at `index`. */
+  resume?: (content: string, index: number) => number;
+}
 
 function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Build a word-boundary matcher regex for one plain-string identifier. */
+/** Characters that continue an identifier: letters, decimal and letter-like digits, combining marks, `_`. */
+const IDENTIFIER_CHARS = "\\p{L}\\p{Nd}\\p{Nl}\\p{M}_";
+/**
+ * Scripts written without spaces between words. Text in them runs straight
+ * into an embedded Latin word (`查看payout报表`, `payout을`), so next to an
+ * identifier that starts or ends with an ASCII character they do not count
+ * as part of the same word.
+ */
+const UNSPACED_SCRIPTS = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Hangul}";
+const STARTS_WITH_ASCII_WORD_CHAR = /^[A-Za-z0-9_]/;
+const ENDS_WITH_ASCII_WORD_CHAR = /[A-Za-z0-9_]$/;
+const STARTS_WITH_IDENTIFIER_CHAR = new RegExp(`^[${IDENTIFIER_CHARS}]`, "u");
+const ENDS_WITH_IDENTIFIER_CHAR = new RegExp(`[${IDENTIFIER_CHARS}]$`, "u");
+
+/**
+ * Build a matcher regex for one plain-string identifier.
+ *
+ * Word boundaries are Unicode-aware lookarounds, not `\b` (which only knows
+ * ASCII letters, digits and `_`): the identifier must not be directly
+ * preceded or followed by a letter, digit, combining mark or `_` in any
+ * script. So "комиссия" and "佣金" are found, and "commission" is not found
+ * inside "commissionés". A boundary is only required on a side where the
+ * identifier itself starts or ends with such a character, so "$payout",
+ * "@payout/core" and "rate%" are found too. `$` does not continue an
+ * identifier here, so "payout" is still found in a Svelte-style `$payout`.
+ * Characters like `²` and `½` are not identifier characters either. On an
+ * ASCII edge, Han, kana and Hangul neighbors do not count as part of the word
+ * (see UNSPACED_SCRIPTS); a non-ASCII identifier edge is strict, so "佣金" is
+ * not found inside "佣金率". It will NOT catch this identifier as a fragment
+ * of a larger camelCase or snake_case identifier (e.g. "payout" inside
+ * "computePayoutForCard" or "payout_rate_bps"); set `matchIdentifierParts`
+ * (see `toPartsMatcher`) or pass a RegExp without a boundary (e.g. /payout/i)
+ * for that.
+ */
 function toMatcher(identifier: string, caseInsensitive: boolean): RegExp {
-  // \b works on word characters, so this also catches identifiers embedded
-  // in import specifiers like "@/lib/affiliate" (the '/' and quote around
-  // it are non-word characters, so the boundary still lands correctly).
-  // It will NOT catch this identifier as a fragment of a larger camelCase or
-  // snake_case identifier (e.g. "payout" inside "computePayoutForCard" or
-  // "payout_rate_bps") — pass a RegExp without \b (e.g. /payout/i) for that.
-  const flags = "g" + (caseInsensitive ? "i" : "");
-  return new RegExp(`\\b${escapeRegExp(identifier)}\\b`, flags);
+  const startsWord = STARTS_WITH_IDENTIFIER_CHAR.test(identifier);
+  const endsWord = ENDS_WITH_IDENTIFIER_CHAR.test(identifier);
+  const word = (ascii: boolean): string => (ascii ? `(?![${UNSPACED_SCRIPTS}])[${IDENTIFIER_CHARS}]` : `[${IDENTIFIER_CHARS}]`);
+  const before = startsWord ? `(?<!${word(STARTS_WITH_ASCII_WORD_CHAR.test(identifier))})` : "";
+  const after = endsWord ? `(?!${word(ENDS_WITH_ASCII_WORD_CHAR.test(identifier))})` : "";
+  return new RegExp(`${before}${escapeRegExp(identifier)}${after}`, "gu" + (caseInsensitive ? "i" : ""));
 }
+
+// ---- Identifier-part matching (opt-in `matchIdentifierParts`) ------------------
+//
+// A candidate is found with a plain escaped regex, then accepted only if both
+// ends sit on a part boundary. Each boundary check reads at most three code
+// points, so a scan costs the search plus constant work per candidate, and no
+// pattern can backtrack. The classification regexes carry no `i` flag: under
+// `iu`, `\p{Lu}` also matches lowercase letters.
+
+const IS_UPPER = /^[\p{Lu}\p{Lt}]$/u;
+const IS_LOWER = /^\p{Ll}$/u;
+const IS_LETTER = /^\p{L}$/u;
+const IS_DIGIT = /^\p{Nd}$/u;
+const IS_MARK = /^\p{M}$/u;
+const IS_UNSPACED = new RegExp(`^[${UNSPACED_SCRIPTS}]$`, "u");
+
+type CharClass = "upper" | "lower" | "caseless" | "digit" | "mark" | "other";
+
+function classOf(ch: string): CharClass {
+  if (IS_UPPER.test(ch)) return "upper";
+  if (IS_LOWER.test(ch)) return "lower";
+  if (IS_DIGIT.test(ch)) return "digit";
+  if (IS_MARK.test(ch)) return "mark";
+  if (IS_LETTER.test(ch)) return "caseless";
+  return "other"; // `_`, `$`, `-`, whitespace, punctuation, symbols
+}
+
+/** The code point that ends just before `index`, or "" at the start. */
+function codePointBefore(content: string, index: number): string {
+  if (index <= 0) return "";
+  const low = content.charCodeAt(index - 1);
+  if (low >= 0xdc00 && low <= 0xdfff && index >= 2) {
+    const high = content.charCodeAt(index - 2);
+    if (high >= 0xd800 && high <= 0xdbff) return content.slice(index - 2, index);
+  }
+  return content.charAt(index - 1);
+}
+
+/** The code point that starts at `index`, or "" at the end. */
+function codePointAt(content: string, index: number): string {
+  if (index >= content.length) return "";
+  const code = content.codePointAt(index) ?? 0;
+  return content.slice(index, index + (code > 0xffff ? 2 : 1));
+}
+
+/**
+ * Is the position between `content[index - 1]` and `content[index]` the edge of
+ * an identifier part? `asciiEdge` is true when the identifier being matched has
+ * an ASCII word character on this side; only then does a Han, kana or Hangul
+ * neighbor count as outside the word (the same rule as whole-word matching).
+ */
+function isPartBoundary(content: string, index: number, asciiEdge: boolean): boolean {
+  const prev = codePointBefore(content, index);
+  const next = codePointAt(content, index);
+  if (prev === "" || next === "") return true;
+  const before = classOf(prev);
+  const after = classOf(next);
+  if (after === "mark") return false;
+  if (before === "other" || after === "other") return true;
+  if (asciiEdge && IS_UNSPACED.test(prev) !== IS_UNSPACED.test(next)) return true;
+  if (before === "digit" || after === "digit") return before !== after; // letter <-> digit
+  if (after === "upper") {
+    if (before === "lower" || before === "mark") return true; // affiliateUrl
+    if (before === "upper") return classOf(codePointAt(content, index + next.length)) === "lower"; // XMLHttp
+  }
+  return false;
+}
+
+/** Build the matcher for one string identifier in parts mode: a plain search plus a boundary check. */
+function toPartsMatcher(identifier: string, caseInsensitive: boolean): Matcher {
+  const startsAscii = STARTS_WITH_ASCII_WORD_CHAR.test(identifier);
+  const endsAscii = ENDS_WITH_ASCII_WORD_CHAR.test(identifier);
+  // A start can only be valid on a part boundary, unless the identifier itself starts with a symbol.
+  const needsStartBoundary = classOf(codePointAt(identifier, 0)) !== "other";
+  return {
+    label: identifier,
+    regex: new RegExp(escapeRegExp(identifier), "gu" + (caseInsensitive ? "i" : "")),
+    accepts: (content, start, end) => isPartBoundary(content, start, startsAscii) && isPartBoundary(content, end, endsAscii),
+    // Skip straight to the next part boundary instead of retrying the literal at every character.
+    // Each position is visited once, so the whole scan stays linear in the file size.
+    resume: (content, index) => {
+      let next = index + codePointAt(content, index).length;
+      if (!needsStartBoundary) return next;
+      while (next < content.length && !isPartBoundary(content, next, startsAscii)) next += codePointAt(content, next).length;
+      return next;
+    },
+  };
+}
+
+/** Leading and trailing whitespace and invisible (default-ignorable) characters of an identifier. */
+const IDENTIFIER_PADDING = /^[\s\p{Default_Ignorable_Code_Point}]+|[\s\p{Default_Ignorable_Code_Point}]+$/gu;
 
 /** Keywords after which a `/` starts a regular expression, not a division. */
 const REGEX_AFTER_KEYWORD = new Set([
@@ -494,8 +688,27 @@ const REGEX_AFTER_KEYWORD = new Set([
 /** Punctuators after which a `/` starts a regular expression, not a division. */
 const REGEX_AFTER_PUNCTUATOR = new Set([..."(,=:[!&|?{};+-*%<>~^}"]);
 
+/** Keywords directly followed by a statement block (`else {`, `catch {`, `static {`). */
+const BLOCK_AFTER_KEYWORD = new Set(["else", "try", "finally", "do", "catch", "static"]);
+
+/** Keywords that start a declaration or clause whose `{` opens a body (a class body, a case block). */
+const BLOCK_CUE_KEYWORD = new Set(["class", "interface", "enum", "namespace", "module", "case", "default"]);
+
+/** The line terminators of JavaScript: LF, CR, U+2028 and U+2029. A `//` comment ends at any of them. */
+function isLineTerminator(ch: string): boolean {
+  return ch === "\n" || ch === "\r" || ch === "\u2028" || ch === "\u2029";
+}
+
 function isWordChar(ch: string): boolean {
   return /[\p{ID_Continue}$]/u.test(ch);
+}
+
+/** Index of the first line terminator at or after `from`, or the end of `src`. */
+function endOfLine(src: string, from: number): number {
+  for (let j = from; j < src.length; j += 1) {
+    if (isLineTerminator(src.charAt(j))) return j;
+  }
+  return src.length;
 }
 
 /** Index just past a quoted string that starts at `start`, or of the line break that ends it unterminated. */
@@ -504,11 +717,12 @@ function endOfQuoted(src: string, start: number, quote: string): number {
   while (j < src.length) {
     const ch = src.charAt(j);
     if (ch === "\\") {
-      j += 2; // an escape, including a line continuation
+      // An escape, including a line continuation (a CRLF counts as one).
+      j += src.charAt(j + 1) === "\r" && src.charAt(j + 2) === "\n" ? 3 : 2;
       continue;
     }
     if (ch === quote) return j + 1;
-    if (ch === "\n") return j;
+    if (ch === "\n" || ch === "\r") return j;
     j += 1;
   }
   return src.length;
@@ -520,9 +734,9 @@ function endOfRegex(src: string, start: number): number {
   let j = start + 1;
   while (j < src.length) {
     const ch = src.charAt(j);
-    if (ch === "\n") return j;
+    if (isLineTerminator(ch)) return j;
     if (ch === "\\") {
-      if (src.charAt(j + 1) === "\n") return j + 1;
+      if (isLineTerminator(src.charAt(j + 1))) return j + 1;
       j += 2;
       continue;
     }
@@ -532,6 +746,24 @@ function endOfRegex(src: string, start: number): number {
     j += 1;
   }
   return src.length;
+}
+
+/** A JSX closing tag, from its `/` on: `/div>`, `/>`, `/Ui.Card >`, `/svg:g>`. */
+const closingTag = /\/\s*(?:[\p{ID_Start}_$][\p{ID_Continue}$.:-]*\s*)?>/uy;
+
+/**
+ * Whether JSX tag rules apply to a file: always in `.jsx` and `.tsx`, never in
+ * `.ts`, `.mts` and `.cts` (TypeScript has no JSX there), and in any other
+ * file (`.js`, `.svelte`, a name with no extension) only after a JSX opener
+ * such as `<Foo` or `<>` has been seen in a place where an expression can start.
+ */
+type JsxMode = "always" | "never" | "auto";
+
+function jsxModeFor(path: string): JsxMode {
+  const extension = /\.([A-Za-z0-9]+)$/.exec(path)?.[1]?.toLowerCase() ?? "";
+  if (extension === "jsx" || extension === "tsx") return "always";
+  if (extension === "ts" || extension === "mts" || extension === "cts") return "never";
+  return "auto";
 }
 
 /** An open template literal, or a `${ }` expression inside one (with the `{` opened inside it). */
@@ -544,23 +776,121 @@ type LexFrame = { kind: "template" } | { kind: "expression"; braces: number };
  * break), template literals across lines (including nested `${ }`
  * expressions, with brace depth tracked, and the strings, templates and
  * comments inside them), and regular-expression literals, so a `//` or `/*`
- * inside any of those is not mistaken for a comment. A `/` starts a regex
- * literal when it follows an operator, an opening bracket, `;`, `}`, the
- * start of the file, or a keyword such as `return`; otherwise it is division.
- * A block comment is replaced by one space (never by nothing), so the tokens
- * on either side of it stay separate.
+ * inside any of those is not mistaken for a comment. A line comment ends at
+ * any JavaScript line terminator (`\n`, `\r`, U+2028 or U+2029). A block
+ * comment is replaced by one space (never by nothing), so the tokens on either
+ * side of it stay separate.
+ *
+ * Whether a `/` starts a regex literal or is a division (or part of JSX) is
+ * guessed from the code before it:
+ * - at the start of the file, after a keyword such as `return`, or after an
+ *   operator or opening bracket, it starts a regex;
+ * - right after `<` it is part of a closing tag only when a tag name (or
+ *   nothing) and `>` follow (`</div>`, `</>`, `</Ui.Card>`); otherwise
+ *   (`a</[/*]/.test(b)`, or `a < /re/` with a space) it starts a regex;
+ * - after a `}` it starts a regex when the brace closed a statement block
+ *   (`if (x) {...}`, `else {...}`, an arrow body, a bare block) and divides
+ *   when it closed an object literal or JSX expression (`{a} / {b}`,
+ *   `{} /= 2`); a `/` followed by `>` after any `}` is a self-closing tag
+ *   (`<Foo {...p} />`);
+ * - after `>` it does not start a regex when the next character is `>`
+ *   (`<Foo<T> />`) unless a line break came first;
+ * - after `++` or `--` it divides when the operator is postfix (`i++ / 2`,
+ *   `a[0]-- / 2`, judged by what precedes it) and starts a regex when it is
+ *   prefix (`++/re/.lastIndex`); after a single `+` or `-` it starts a regex.
  *
  * Known limits: a regex literal right after `)` or `]` (`if (ok) /re/`) is
- * read as division, and a lone backtick in JSX text opens a template literal
- * that never closes. Either can desynchronize the lexer, and a later `/*` can
- * then hide the code after it.
+ * read as division, JSX text is not tokenized (a `//` in it starts a
+ * comment), and a lone backtick in
+ * JSX text opens a template literal that never closes. Either can
+ * desynchronize the lexer, and a later `/*` can then hide the code after it.
  */
-function removeComments(src: string): string {
+function removeComments(src: string, jsxMode: JsxMode): string {
   const frames: LexFrame[] = [];
   let out = "";
   let prev = ""; // last significant code character ("" at the start of the file)
+  let prevIndex = -1; // where `prev` is in `src`, or -1 when it ends a string, template or regex
+  let lineBreak = false; // a line terminator came after `prev`
   let word = ""; // the identifier or keyword that ends at `prev`
+  const braces: boolean[] = []; // for each open `{` in code: true when it opens a statement block
+  let closedBlock = true; // whether the `}` that is `prev` closed a statement block
+  let blockCue = false; // `class`, `case` or similar was read in this statement, so the next `{` is a body
+  let jsxSeen = false; // a JSX opener (`<Foo`, `<>`) was read
+  const jsxOn = (): boolean => jsxMode === "always" || (jsxMode === "auto" && jsxSeen);
   let i = 0;
+
+  /** True when the code before the current character is one after which an expression can start. */
+  const startsExpression = (): boolean =>
+    prev === "" || (isWordChar(prev) ? REGEX_AFTER_KEYWORD.has(word) : REGEX_AFTER_PUNCTUATOR.has(prev));
+
+  /** True when the `{` being read opens a statement block (`if (x) {`), false for an object literal or JSX expression. */
+  const opensBlock = (): boolean => {
+    if (blockCue || prev === "") return true;
+    if (isWordChar(prev)) return BLOCK_AFTER_KEYWORD.has(word);
+    switch (prev) {
+      case ")":
+      case ";":
+        return true;
+      case "}":
+        return closedBlock; // `} {` after a block is a block; `{a}{b}` in JSX is not
+      case "{":
+        return braces.at(-1) ?? true; // directly inside a block is a block; inside an object it is an object
+      case ">":
+        return src.charAt(prevIndex - 1) === "="; // `=> {` is a body, `<p>{` is a JSX expression
+      case ":":
+        return isLabel(prevIndex); // `outer: {` is a labeled block, `a: {` is an object property
+      default:
+        return false;
+    }
+  };
+
+  /** True when the `:` at `colon` ends a statement label (`outer:`) rather than a property name or a ternary branch. */
+  const isLabel = (colon: number): boolean => {
+    let j = colon - 1;
+    while (j >= 0 && /\s/.test(src.charAt(j))) j -= 1;
+    const labelEnd = j;
+    while (j >= 0 && isWordChar(src.charAt(j))) j -= 1;
+    if (j === labelEnd) return false;
+    while (j >= 0 && /\s/.test(src.charAt(j))) j -= 1;
+    const before = j >= 0 ? src.charAt(j) : "";
+    if (before === "" || before === ";" || before === "}") return true;
+    return before === "{" && (braces.at(-1) ?? true); // a label is the first thing in a block; a property is the first thing in an object
+  };
+
+  /** True when the `++` or `--` that ends at `prev` is postfix (`i++`, `a[0]--`), judged by what precedes it. */
+  const isPostfixStep = (): boolean => {
+    let j = prevIndex - 2;
+    while (j >= 0 && /\s/.test(src.charAt(j))) j -= 1;
+    const before = j >= 0 ? src.charAt(j) : "";
+    return before === ")" || before === "]" || (before !== "" && isWordChar(before));
+  };
+
+  /** True when a `/` at index `at` starts a regex literal rather than dividing. */
+  const startsRegex = (at: number): boolean => {
+    if (prev === "") return true;
+    if (isWordChar(prev)) return REGEX_AFTER_KEYWORD.has(word);
+    if (!REGEX_AFTER_PUNCTUATOR.has(prev)) return false;
+    switch (prev) {
+      case "<": {
+        // `</div>`, `</>` and `</a.b>` close a JSX tag. Anything else after `</` is a regex.
+        if (!jsxOn() || prevIndex !== at - 1) return true;
+        closingTag.lastIndex = at;
+        return !closingTag.test(src);
+      }
+      case "}":
+        if (jsxOn() && src.charAt(at + 1) === ">") return false; // `<Foo {...p} />`
+        return closedBlock; // after a statement block a slash starts a regex; after an expression it divides
+      case ">":
+        if (!jsxOn() || src.charAt(prevIndex - 1) === "=") return true; // `x => />/.test(s)`
+        return src.charAt(at + 1) !== ">" || lineBreak; // `<Foo<T> />`
+      case "+":
+      case "-":
+        return !(prevIndex > 0 && src.charAt(prevIndex - 1) === prev && isPostfixStep()); // `i++ / 2` divides
+      default:
+        return true;
+    }
+  };
+
   while (i < src.length) {
     const ch = src.charAt(i);
     const frame = frames.at(-1);
@@ -573,11 +903,15 @@ function removeComments(src: string): string {
         frames.pop();
         out += ch;
         prev = ch;
+        prevIndex = -1;
+        lineBreak = false;
         i += 1;
       } else if (ch === "$" && src.charAt(i + 1) === "{") {
-        frames.push({ kind: "expression", braces: 0 });
+        appendOwn(frames, { kind: "expression", braces: 0 });
         out += "${";
         prev = "{";
+        prevIndex = -1;
+        lineBreak = false;
         i += 2;
       } else {
         out += ch;
@@ -588,8 +922,7 @@ function removeComments(src: string): string {
 
     const next = src.charAt(i + 1);
     if (ch === "/" && next === "/") {
-      const end = src.indexOf("\n", i);
-      i = end === -1 ? src.length : end; // keep the line break itself
+      i = endOfLine(src, i); // keep the line break itself
       continue;
     }
     if (ch === "/" && next === "*") {
@@ -598,7 +931,9 @@ function removeComments(src: string): string {
       // Leave a space where the comment was, so `return/* x */commission`
       // still reads as two tokens (and `pay/* x */out` does not become one),
       // plus the comment's own line breaks.
-      out += " " + src.slice(i + 2, stop).replace(/[^\n]/g, "");
+      const inside = src.slice(i + 2, stop);
+      if (/[\n\r\u2028\u2029]/.test(inside)) lineBreak = true;
+      out += " " + inside.replace(/[^\r\n]/g, "");
       i = end === -1 ? src.length : end + 2;
       continue;
     }
@@ -606,19 +941,23 @@ function removeComments(src: string): string {
       const end = endOfQuoted(src, i, ch);
       out += src.slice(i, end);
       prev = ch;
+      prevIndex = -1;
+      lineBreak = false;
       i = end;
       continue;
     }
     if (ch === "`") {
-      frames.push({ kind: "template" });
+      appendOwn(frames, { kind: "template" });
       out += ch;
       i += 1;
       continue;
     }
-    if (ch === "/" && (prev === "" || (isWordChar(prev) ? REGEX_AFTER_KEYWORD.has(word) : REGEX_AFTER_PUNCTUATOR.has(prev)))) {
+    if (ch === "/" && startsRegex(i)) {
       const end = endOfRegex(src, i);
       out += src.slice(i, end);
       prev = ")"; // a `/` right after a regex literal divides
+      prevIndex = -1;
+      lineBreak = false;
       i = end;
       continue;
     }
@@ -636,8 +975,24 @@ function removeComments(src: string): string {
       }
     }
     if (!/\s/.test(ch)) {
+      if (ch === "{") {
+        appendOwn(braces, opensBlock());
+        blockCue = false;
+      } else if (ch === "}") {
+        closedBlock = braces.pop() ?? true;
+        blockCue = false;
+      } else if (ch === ";" || ch === "=") {
+        blockCue = false;
+      } else if (ch === "<" && jsxMode !== "never" && startsExpression() && /[\p{ID_Start}$_>]/u.test(src.charAt(i + 1))) {
+        jsxSeen = true; // `<Foo` or `<>` where an expression can start: JSX
+      }
       word = isWordChar(ch) ? (isWordChar(src.charAt(i - 1)) ? word + ch : ch) : "";
+      if (isWordChar(ch) && !isWordChar(src.charAt(i + 1)) && BLOCK_CUE_KEYWORD.has(word)) blockCue = true;
       prev = ch;
+      prevIndex = i;
+      lineBreak = false;
+    } else if (isLineTerminator(ch)) {
+      lineBreak = true;
     }
     out += ch;
     i += 1;
@@ -678,7 +1033,7 @@ function readScanOptions(opts: unknown): Required<AssertNoPayoutImportsOptions> 
   if (opts === undefined) return { ...DEFAULT_OPTIONS };
   if (!isPlainRecord(opts)) throw new TypeError("assertNoPayoutImports: opts must be a plain object (or omitted).");
   const resolved = { ...DEFAULT_OPTIONS };
-  for (const key of ["stripComments", "caseInsensitive"] as const) {
+  for (const key of ["stripComments", "caseInsensitive", "matchIdentifierParts"] as const) {
     const value = opts[key];
     if (value === undefined) continue;
     if (typeof value !== "boolean") throw new TypeError(`assertNoPayoutImports: opts.${key} must be a boolean (or omitted).`);
@@ -687,8 +1042,11 @@ function readScanOptions(opts: unknown): Required<AssertNoPayoutImportsOptions> 
   return resolved;
 }
 
+/** Longest string identifier accepted (UTF-16 code units, after trimming). */
+const MAX_IDENTIFIER_LENGTH = 1024;
+
 /** Validate every identifier with one indexed pass and build its matcher. */
-function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { label: string; regex: RegExp }[] {
+function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean, identifierParts: boolean): Matcher[] {
   if (!Array.isArray(payoutIdentifiers)) {
     throw new TypeError("assertNoPayoutImports: payoutIdentifiers must be an array of strings and/or RegExps.");
   }
@@ -698,28 +1056,97 @@ function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { l
       "assertNoPayoutImports: payoutIdentifiers is empty, so nothing would be matched. Pass at least one identifier.",
     );
   }
-  const matchers: { label: string; regex: RegExp }[] = [];
+  const matchers: Matcher[] = [];
   for (let index = 0; index < length; index += 1) {
     if (!hasOwn(payoutIdentifiers, index)) {
       throw new TypeError(`assertNoPayoutImports: payoutIdentifiers[${index}] is missing (a hole in a sparse array).`);
     }
     const identifier: unknown = payoutIdentifiers[index];
     if (typeof identifier === "string") {
-      if (isBlank(identifier)) {
+      const trimmed = identifier.replace(IDENTIFIER_PADDING, "");
+      if (trimmed === "") {
         throw new TypeError(
           `assertNoPayoutImports: payoutIdentifiers[${index}] is blank (only whitespace or invisible characters).`,
         );
       }
-      matchers.push({ label: identifier, regex: toMatcher(identifier, caseInsensitive) });
+      // Each string becomes one regular expression. Some JavaScript engines in the supported
+      // range (Node 20 and 22) overflow their stack compiling a case-insensitive pattern tens of
+      // thousands of characters long, so a string identifier has a documented maximum length.
+      if (trimmed.length > MAX_IDENTIFIER_LENGTH) {
+        throw new TypeError(
+          `assertNoPayoutImports: payoutIdentifiers[${index}] is ${trimmed.length} characters long; the maximum is ${MAX_IDENTIFIER_LENGTH}.`,
+        );
+      }
+      appendOwn(
+        matchers,
+        identifierParts
+          ? toPartsMatcher(trimmed, caseInsensitive)
+          : { label: trimmed, regex: toMatcher(trimmed, caseInsensitive) },
+      );
     } else if (typeof identifier === "object" && identifier !== null && kindOf(identifier) === "RegExp") {
       // Read through the RegExp's internal slots, not its own `source`/`flags`.
+      // The pattern runs over the whole file (see `findMatches`): `g` makes it
+      // find every match, `m` keeps `^` and `$` meaning line start and end, and
+      // a sticky `y` would only match at one position, so it is dropped.
       const { source, flags } = regExpParts(identifier);
-      matchers.push({ label: source, regex: new RegExp(source, flags.includes("g") ? flags : flags + "g") });
+      const scanFlags = [...new Set([...flags.replace("y", ""), "g", "m"])].join("");
+      appendOwn(matchers, { label: source, regex: new RegExp(source, scanFlags) });
     } else {
       throw new TypeError(`assertNoPayoutImports: payoutIdentifiers[${index}] must be a string or a RegExp.`);
     }
   }
   return matchers;
+}
+
+/** The text and start offset of every line of `content` (lines end at LF, CRLF or a lone CR). */
+function splitLines(content: string): { text: string; start: number }[] {
+  const lines: { text: string; start: number }[] = [];
+  const terminator = /\r\n|\r|\n/g;
+  let start = 0;
+  for (let found = terminator.exec(content); found !== null; found = terminator.exec(content)) {
+    appendOwn(lines, { text: content.slice(start, found.index), start });
+    start = found.index + found[0].length;
+  }
+  appendOwn(lines, { text: content.slice(start), start });
+  return lines;
+}
+
+/**
+ * Run every matcher over the whole content (so a pattern may span lines) and
+ * report each line where a match starts, once per matcher, in line order.
+ */
+function findMatches(content: string, matchers: Matcher[]): PayoutImportOffense["matches"] {
+  const lines = splitLines(content);
+  const found: { line: number; order: number; match: PayoutImportOffense["matches"][number] }[] = [];
+  matchers.forEach(({ label, regex, accepts, resume }, order) => {
+    regex.lastIndex = 0;
+    let lineIndex = 0;
+    let reported = -1;
+    for (let hit = regex.exec(content); hit !== null; hit = regex.exec(content)) {
+      if (hit[0] === "") {
+        // An empty match must not loop forever. In a Unicode pattern, step over a whole
+        // code point: stopping inside a surrogate pair makes the next search back up.
+        const unicode = regex.flags.includes("u") || regex.flags.includes("v");
+        regex.lastIndex += unicode && (content.codePointAt(regex.lastIndex) ?? 0) > 0xffff ? 2 : 1;
+      }
+      if (accepts !== undefined && !accepts(content, hit.index, hit.index + hit[0].length)) {
+        // Not on a part boundary. Resume at the next place a valid candidate can start, so an
+        // overlapping candidate is still seen.
+        regex.lastIndex = resume !== undefined ? resume(content, hit.index) : hit.index + 1;
+        continue;
+      }
+      while (lineIndex + 1 < lines.length && (lines[lineIndex + 1]?.start ?? Infinity) <= hit.index) lineIndex += 1;
+      if (lineIndex === reported) continue;
+      reported = lineIndex;
+      appendOwn(found, {
+        line: lineIndex + 1,
+        order,
+        match: { identifier: label, line: lineIndex + 1, text: (lines[lineIndex]?.text ?? "").trim() },
+      });
+    }
+  });
+  found.sort((x, y) => x.line - y.line || x.order - y.order);
+  return found.map((entry) => entry.match);
 }
 
 /**
@@ -740,7 +1167,7 @@ function readSourceFiles(files: unknown): [string, string][] {
       if (typeof path !== "string" || isBlank(path)) {
         throw new TypeError(`assertNoPayoutImports: files[${index}] must be a non-blank path string.`);
       }
-      paths.push(path);
+      appendOwn(paths, path);
     }
     const { readFileSync } = loadNodeFs();
     return paths.map((path) => [path, readFileSync(path, "utf8")]);
@@ -769,9 +1196,12 @@ function readSourceFiles(files: unknown): [string, string][] {
  * access at all — use this for non-Node runtimes or when you've already
  * walked an import graph yourself and gathered the file contents).
  *
- * `payoutIdentifiers` is a list of plain identifiers (matched as whole
- * words / import-path segments, e.g. `"commission"`, `"affiliateRate"`,
- * `"payout"`) and/or regular expressions for more specific patterns.
+ * `payoutIdentifiers` is a list of plain identifiers (trimmed, then matched
+ * as whole words / import-path segments with Unicode-aware boundaries, e.g.
+ * `"commission"`, `"affiliateRate"`, `"payout"`, `"комиссия"`) and/or regular
+ * expressions for more specific patterns. A RegExp runs over the whole file
+ * (with `g` and `m` added and `y` dropped) and is reported at the line where
+ * each match starts.
  *
  * Returns the list of offending files (empty if none) so a caller's test
  * can assert that list is empty:
@@ -784,8 +1214,9 @@ function readSourceFiles(files: unknown): [string, string][] {
  * closures that capture a payout value without naming it in the scanned
  * file, computed/dynamic property access (`obj["pay" + "out"]`), a `payout`
  * re-exported under an aliased name, or a `require`/`import()` built from a
- * runtime string. It also will not catch a forbidden word embedded inside a
- * larger identifier with no delimiter (see `toMatcher`). See README.md,
+ * runtime string. By default it also will not catch a forbidden word embedded
+ * inside a larger identifier (see `toMatcher`); `opts.matchIdentifierParts`
+ * finds it when the word is a camelCase, snake_case or kebab-case part. See README.md,
  * "Honest limits", for the full list — an empty result is a signal, not a
  * guarantee.
  *
@@ -803,28 +1234,18 @@ export function assertNoPayoutImports(
   payoutIdentifiers: (string | RegExp)[],
   opts?: AssertNoPayoutImportsOptions,
 ): PayoutImportOffense[] {
-  const { stripComments, caseInsensitive } = readScanOptions(opts);
-  const matchers = readMatchers(payoutIdentifiers, caseInsensitive);
+  const { stripComments, caseInsensitive, matchIdentifierParts } = readScanOptions(opts);
+  const matchers = readMatchers(payoutIdentifiers, caseInsensitive, matchIdentifierParts);
   const sources = readSourceFiles(files);
 
   const offenses: PayoutImportOffense[] = [];
 
   for (const [path, rawContent] of sources) {
-    const content = stripComments ? removeComments(rawContent) : rawContent;
-    const lines = content.split("\n");
-    const matches: PayoutImportOffense["matches"] = [];
-
-    lines.forEach((lineText, idx) => {
-      for (const { label, regex } of matchers) {
-        regex.lastIndex = 0;
-        if (regex.test(lineText)) {
-          matches.push({ identifier: label, line: idx + 1, text: lineText.trim() });
-        }
-      }
-    });
+    const content = stripComments ? removeComments(rawContent, jsxModeFor(path)) : rawContent;
+    const matches = findMatches(content, matchers);
 
     if (matches.length > 0) {
-      offenses.push({ file: path, matches });
+      appendOwn(offenses, { file: path, matches });
     }
   }
 

@@ -25,7 +25,12 @@
 5. `assertNoPayoutImports` is a text-pattern grep, not a parser: it never
    evaluates or imports the files it scans, and it does not follow the
    import graph. An empty scope (no files or no identifiers) or a blank
-   identifier throws a `TypeError` rather than returning a clean `[]`.
+   identifier throws a `TypeError` rather than returning a clean `[]`. String
+   identifiers are whole words by default; `matchIdentifierParts` also finds
+   them as camelCase, snake_case or kebab-case parts. A rejected
+   candidate skips ahead to the next part boundary, so the scan stays linear in
+   the file size (no backtracking pattern), and the default result does not
+   change.
 6. Zero runtime dependencies (`dependencies` stays empty).
 
 ## Setup and verification
@@ -33,7 +38,8 @@
 ```bash
 npm ci
 npm run verify   # lint, typecheck, test, build, verify:package
-npm audit --include=dev
+npm run audit:dependencies
+npm run attw
 ```
 
 `verify:package` packs the tarball, installs it into a temp project
@@ -54,7 +60,7 @@ has a regression test that failed against the pre-fix commit.
   security control.
 - Performance is measured only roughly. Each `assertPayoutInvariance` run
   deep-copies `baseInput` and the baseline result and compares them after
-  each call. `deepEqual` brand-checks each object once (about 15 to 25
+  each call. `deepEqual` brand-checks each object once (about 22 to 25
   microseconds per new object on Node 26, measured on 40,000 objects) and
   caches the result; its object `Set`/`Map` matching is quadratic in the
   number of object members.
@@ -67,10 +73,18 @@ has a regression test that failed against the pre-fix commit.
 - Known false passes of the default comparison (README, "Honest limits"):
   state kept only in private `#fields`, and one shared `Error`, `DataView`
   or boxed primitive returned and edited on every call.
+- `assertNoPayoutImports` matches whole words by default. With
+  `matchIdentifierParts` it still misses a word fused into a longer word with
+  no separator and no case change (`payoutrate`, `mypayout`), and it treats
+  plurals and other word forms as different words.
 - `assertNoPayoutImports`'s comment stripper is a lexer, not a parser: a
-  regex literal right after `)` or `]` is read as division, and a lone
-  backtick in JSX text opens a template that never closes, so either can
-  hide code from the check.
+  regex literal right after `)` or `]` is read as division, a lone
+  backtick in JSX text opens a template that never closes, and JSX text is
+  not tokenized (a `//` in it starts a comment), so any of these can hide
+  code from the check.
+- `deepEqual` ignores `Map` entry order, `Set` member order and object key
+  order by default. `orderSensitive: true` makes them count; the default
+  stays order-insensitive on purpose (README, "Honest limits").
 
 ## Are the types wrong? (attw)
 
@@ -78,7 +92,7 @@ CI runs [`arethetypeswrong`](https://github.com/arethetypeswrong/arethetypeswron
 (`npm run attw`, which is `attw --pack . --ignore-rules cjs-resolves-to-esm`)
 against the packed tarball after the build step. The `cjs-resolves-to-esm` rule is ignored on
 purpose: this is an ESM-only package (`"type": "module"`, no `require` entry point), so a
-CommonJS consumer must use Node's `require(esm)` support (Node >=20.19 or >=22.12 — see
+CommonJS consumer must use Node's `require(esm)` support (Node >=20.19 or >=22.12; see
 "Runtime support policy" below) rather than a native `require`. A dual CJS+ESM build was
 rejected to avoid the dual-package hazard (two separately-identified copies of the same module,
 with broken `instanceof` checks and duplicated module state across the CJS and ESM entry
@@ -98,7 +112,7 @@ job. (You can also run `npm publish` locally; `prepublishOnly` still guards it.)
 
 npm's unpublish policy is deliberately narrow. Within 72 hours of publishing, a version can be
 unpublished only if no other published package depends on it. After 72 hours, unpublishing also
-requires fewer than 300 downloads in the last week and a single maintainer — most released
+requires fewer than 300 downloads in the last week and a single maintainer, so most released
 versions won't qualify either way. A given `name@version` can never be reused, published or
 not, even after an unpublish. Treat unpublish as unavailable: prefer fixing forward with a new
 patch version, and use `npm deprecate <name>@"<range>" "<message>"` to warn consumers off a
@@ -109,9 +123,8 @@ This is a dev-time library with no stored state, so there is nothing else to rol
 ### Runtime support policy
 
 - **Supported (recommended for production):** Node 22 and 24 LTS; Node 26 current.
-- **Compatibility-tested:** Node 20. Node 20 is end-of-life — nodejs.org's release page
-  (<https://nodejs.org/en/about/previous-releases>) lists it as `EOL`, with its final release
-  dated Mar 24, 2026. The `compat` job in `verify.yml` still runs on Node 20 to catch
+- **Compatibility-tested:** Node 20. Node 20 is end-of-life (see the Node.js release
+  schedule at <https://nodejs.org/en/about/previous-releases>). The `compat` job in `verify.yml` still runs on Node 20 to catch
   regressions, but that runtime gets no security fixes upstream; don't run production traffic
   on it.
 - CommonJS `require()` of this package needs Node >=20.19 or >=22.12 (`require(esm)`

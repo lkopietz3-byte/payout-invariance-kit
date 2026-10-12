@@ -1,6 +1,6 @@
-# payout-invariance-kit — agent instructions
+# payout-invariance-kit: agent instructions
 
-Check whether a ranking/recommendation/comparison engine's output changes based on which option pays the operator more — a runtime mutation check plus a static import check, both framework-agnostic.
+Check whether a ranking/recommendation/comparison engine's output changes based on which option pays the operator more: a runtime mutation check plus a static import check, both framework-agnostic.
 
 ## Read first
 - `ENGINEERING.md` holds this package's invariants and design rules; read it before changing behavior.
