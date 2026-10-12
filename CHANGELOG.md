@@ -6,8 +6,66 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Some inputs that passed or failed before now give a different (correct) answer,
-so the next release should be a minor version. No version bump here.
+## [0.3.0] - unreleased
+
+Some inputs that passed or failed before now give a different (correct) answer
+and a few inputs now throw, so this is a minor release. Read "Breaking changes"
+before upgrading.
+
+### Breaking changes
+
+Each item says what you will see and what to change.
+
+- `assertPayoutInvariance` throws a `TypeError` when `rankFn` returns
+  `undefined` on the baseline input. Before, a ranker that always returned
+  `undefined` passed. Migration: return the ranking (`[]` for an empty one).
+  `null` and `NaN` are still accepted.
+- `deepEqual` now validates its third argument: `opts` must be a plain object
+  with a boolean `orderSensitive`, or it throws a `TypeError`. Before, a third
+  argument was ignored. `assertPayoutInvariance` throws the same way for a
+  non-boolean `opts.orderSensitive`. Migration: pass `{ orderSensitive: true }`
+  or `{ orderSensitive: false }`, or omit `opts`.
+- `deepEqual` and the in-place check give a different answer for some inputs.
+  Two identical object chains 100,000 levels deep were reported as different
+  and now compare equal (and two identical nested arrays of that depth threw a
+  stack overflow, and now compare equal). An array Proxy that lists an extra
+  key in place of an element key is no longer treated as a plain array, so a
+  difference in that key is now found. A run that passed because of the old
+  answer can now fail. Migration: fix the ranker, or pass your own `isEqual`.
+- A stack overflow raised while a value is being classified now surfaces as an
+  error instead of being read as "not comparable". Migration: pass an
+  `isEqual` that handles that value, or project it to plain data.
+- `assertNoPayoutImports` can report a different set of files. More: non-Latin
+  identifiers (`комиссия`, `佣金`), identifiers that start or end with a symbol
+  (`$payout`), multi-line `RegExp` matches, code after `\r` or U+2028, and
+  `payout` next to Chinese, Japanese or Korean text. Fewer: ASCII words that
+  touch a non-ASCII letter (`commissionés`), and comments after JSX tags or `++`
+  that used to be scanned as code. Migration: review newly reported lines and
+  update any expected-clean list; pass `stripComments: false` for maximum recall.
+- `RegExp` entries in `assertNoPayoutImports` now run over the whole file with
+  `g` and `m` added and `y` dropped, so a pattern with `\s` or a negated class
+  (`[^;]*`) can now match across a line break. Migration: use `.` instead of a
+  negated class where you want a match to stay on one line.
+- A string identifier is trimmed before matching (`"commission "` now matches).
+  A blank one still throws. Migration: none, unless you relied on the padded
+  string matching nothing.
+- The README async recipe throws a `TypeError` for a class-instance input
+  (before it reported "rankIds modified baseInput in place"). Migration: pass
+  plain data, as the recipe now says.
+
+### Added
+
+- New option `matchIdentifierParts` (default `false`) on `assertNoPayoutImports`.
+  When `true`, a string identifier is also found as one part of a longer
+  identifier in camelCase (`affiliateUrl`), snake_case (`affiliate_url`),
+  SCREAMING_CASE (`AFFILIATE_URL`) and kebab-case, at an acronym end
+  (`XMLHttp`) and next to digits (`payout2`). It does not match plurals or
+  other word forms (`affiliates`, `affiliated`) or a word fused into a longer
+  one with no separator (`payoutrate`, `mypayout`). It applies to string
+  identifiers only, runs in linear time, and the default result is unchanged.
+  Why: in a field trial on a real app, a plain word list found 0 of 68
+  references because `affiliateUrl` is one token to a whole-word match. The
+  README example now shows a word list with this option.
 
 ### Fixed
 
@@ -139,7 +197,7 @@ so the next release should be a minor version. No version bump here.
   a lone backtick in JSX text opens a template that never closes, and JSX text
   is not tokenized (a `//` in it starts a comment). No Unicode normalization is
   applied to identifiers or source. CamelCase and snake_case fragments are
-  still not matched by a string identifier.
+  matched by a string identifier only with `matchIdentifierParts`.
 - The `deepEqual` cost note is stated as CPU time, re-measured at 22 to 25
   microseconds per fresh object (first comparison) and about 1.5 microseconds
   per object afterwards on Node 26, Apple silicon. Wall-clock time on a busy
@@ -267,7 +325,7 @@ different (stricter) answer, so this is a minor release.
   sets `inlineSources`, so the map embeds the original source directly.
   `.d.ts.map` generation is turned off instead (see README's "Install").
 - The main entry imported Node's `node:fs` at the top of the file, which
-  bundlers targeting a browser or a Workers runtime resolve at bundle time —
+  bundlers targeting a browser or a Workers runtime resolve at bundle time,
   breaking that build even for callers who never used the file-path mode of
   `assertNoPayoutImports`. `node:fs` is now loaded lazily, only when that
   mode is actually called.

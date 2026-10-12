@@ -488,6 +488,21 @@ export interface AssertNoPayoutImportsOptions {
    * worse than an occasional over-match. Must be a boolean when given.
    */
   caseInsensitive?: boolean;
+  /**
+   * Match a string identifier as one part of a longer identifier, not only as
+   * a whole word. `"affiliate"` is then found in `affiliateUrl`,
+   * `getAffiliate`, `affiliate_url`, `AFFILIATE_URL`, `PayoutRate`,
+   * `XMLAffiliate` and `payout2`, but still not in `affiliates`, `affiliated`
+   * or `prepayout`. Parts are split at `_`, at a lower-to-upper case change
+   * (`affiliateUrl`), at the end of an acronym (`XMLHttp`), and between letters
+   * and digits; `-`, `.`, `/` and other symbols already separate words.
+   * Letters of one case with no separator (`affiliateurl`, `AFFILIATEURL`)
+   * are a single part. Applies to string identifiers only (RegExp entries are
+   * used as written). With `caseInsensitive: false`, write the identifier in
+   * the case the code uses. Defaults to false, so existing scans keep their
+   * results. Must be a boolean when given.
+   */
+  matchIdentifierParts?: boolean;
 }
 
 /** One scanned file that references a forbidden identifier, with every matching line. */
@@ -501,7 +516,16 @@ export interface PayoutImportOffense {
 const DEFAULT_OPTIONS: Required<AssertNoPayoutImportsOptions> = {
   stripComments: true,
   caseInsensitive: true,
+  matchIdentifierParts: false,
 };
+
+/** One compiled identifier: a search regex, plus an optional check on each candidate it finds. */
+interface Matcher {
+  label: string;
+  regex: RegExp;
+  /** When present, a candidate in `[start, end)` counts only if this returns true. */
+  accepts?: (content: string, start: number, end: number) => boolean;
+}
 
 function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -537,8 +561,9 @@ const ENDS_WITH_IDENTIFIER_CHAR = new RegExp(`[${IDENTIFIER_CHARS}]$`, "u");
  * (see UNSPACED_SCRIPTS); a non-ASCII identifier edge is strict, so "佣金" is
  * not found inside "佣金率". It will NOT catch this identifier as a fragment
  * of a larger camelCase or snake_case identifier (e.g. "payout" inside
- * "computePayoutForCard" or "payout_rate_bps"); pass a RegExp without a
- * boundary (e.g. /payout/i) for that.
+ * "computePayoutForCard" or "payout_rate_bps"); set `matchIdentifierParts`
+ * (see `toPartsMatcher`) or pass a RegExp without a boundary (e.g. /payout/i)
+ * for that.
  */
 function toMatcher(identifier: string, caseInsensitive: boolean): RegExp {
   const startsWord = STARTS_WITH_IDENTIFIER_CHAR.test(identifier);
@@ -547,6 +572,84 @@ function toMatcher(identifier: string, caseInsensitive: boolean): RegExp {
   const before = startsWord ? `(?<!${word(STARTS_WITH_ASCII_WORD_CHAR.test(identifier))})` : "";
   const after = endsWord ? `(?!${word(ENDS_WITH_ASCII_WORD_CHAR.test(identifier))})` : "";
   return new RegExp(`${before}${escapeRegExp(identifier)}${after}`, "gu" + (caseInsensitive ? "i" : ""));
+}
+
+// ---- Identifier-part matching (opt-in `matchIdentifierParts`) ------------------
+//
+// A candidate is found with a plain escaped regex, then accepted only if both
+// ends sit on a part boundary. Each boundary check reads at most three code
+// points, so a scan costs the search plus constant work per candidate, and no
+// pattern can backtrack. The classification regexes carry no `i` flag: under
+// `iu`, `\p{Lu}` also matches lowercase letters.
+
+const IS_UPPER = /^[\p{Lu}\p{Lt}]$/u;
+const IS_LOWER = /^\p{Ll}$/u;
+const IS_LETTER = /^\p{L}$/u;
+const IS_DIGIT = /^\p{Nd}$/u;
+const IS_MARK = /^\p{M}$/u;
+const IS_UNSPACED = new RegExp(`^[${UNSPACED_SCRIPTS}]$`, "u");
+
+type CharClass = "upper" | "lower" | "caseless" | "digit" | "mark" | "other";
+
+function classOf(ch: string): CharClass {
+  if (IS_UPPER.test(ch)) return "upper";
+  if (IS_LOWER.test(ch)) return "lower";
+  if (IS_DIGIT.test(ch)) return "digit";
+  if (IS_MARK.test(ch)) return "mark";
+  if (IS_LETTER.test(ch)) return "caseless";
+  return "other"; // `_`, `$`, `-`, whitespace, punctuation, symbols
+}
+
+/** The code point that ends just before `index`, or "" at the start. */
+function codePointBefore(content: string, index: number): string {
+  if (index <= 0) return "";
+  const low = content.charCodeAt(index - 1);
+  if (low >= 0xdc00 && low <= 0xdfff && index >= 2) {
+    const high = content.charCodeAt(index - 2);
+    if (high >= 0xd800 && high <= 0xdbff) return content.slice(index - 2, index);
+  }
+  return content.charAt(index - 1);
+}
+
+/** The code point that starts at `index`, or "" at the end. */
+function codePointAt(content: string, index: number): string {
+  if (index >= content.length) return "";
+  const code = content.codePointAt(index) ?? 0;
+  return content.slice(index, index + (code > 0xffff ? 2 : 1));
+}
+
+/**
+ * Is the position between `content[index - 1]` and `content[index]` the edge of
+ * an identifier part? `asciiEdge` is true when the identifier being matched has
+ * an ASCII word character on this side; only then does a Han, kana or Hangul
+ * neighbor count as outside the word (the same rule as whole-word matching).
+ */
+function isPartBoundary(content: string, index: number, asciiEdge: boolean): boolean {
+  const prev = codePointBefore(content, index);
+  const next = codePointAt(content, index);
+  if (prev === "" || next === "") return true;
+  const before = classOf(prev);
+  const after = classOf(next);
+  if (after === "mark") return false;
+  if (before === "other" || after === "other") return true;
+  if (asciiEdge && IS_UNSPACED.test(prev) !== IS_UNSPACED.test(next)) return true;
+  if (before === "digit" || after === "digit") return before !== after; // letter <-> digit
+  if (after === "upper") {
+    if (before === "lower" || before === "mark") return true; // affiliateUrl
+    if (before === "upper") return classOf(codePointAt(content, index + next.length)) === "lower"; // XMLHttp
+  }
+  return false;
+}
+
+/** Build the matcher for one string identifier in parts mode: a plain search plus a boundary check. */
+function toPartsMatcher(identifier: string, caseInsensitive: boolean): Matcher {
+  const startsAscii = STARTS_WITH_ASCII_WORD_CHAR.test(identifier);
+  const endsAscii = ENDS_WITH_ASCII_WORD_CHAR.test(identifier);
+  return {
+    label: identifier,
+    regex: new RegExp(escapeRegExp(identifier), "gu" + (caseInsensitive ? "i" : "")),
+    accepts: (content, start, end) => isPartBoundary(content, start, startsAscii) && isPartBoundary(content, end, endsAscii),
+  };
 }
 
 /** Leading and trailing whitespace and invisible (default-ignorable) characters of an identifier. */
@@ -918,7 +1021,7 @@ function readScanOptions(opts: unknown): Required<AssertNoPayoutImportsOptions> 
   if (opts === undefined) return { ...DEFAULT_OPTIONS };
   if (!isPlainRecord(opts)) throw new TypeError("assertNoPayoutImports: opts must be a plain object (or omitted).");
   const resolved = { ...DEFAULT_OPTIONS };
-  for (const key of ["stripComments", "caseInsensitive"] as const) {
+  for (const key of ["stripComments", "caseInsensitive", "matchIdentifierParts"] as const) {
     const value = opts[key];
     if (value === undefined) continue;
     if (typeof value !== "boolean") throw new TypeError(`assertNoPayoutImports: opts.${key} must be a boolean (or omitted).`);
@@ -928,7 +1031,7 @@ function readScanOptions(opts: unknown): Required<AssertNoPayoutImportsOptions> 
 }
 
 /** Validate every identifier with one indexed pass and build its matcher. */
-function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { label: string; regex: RegExp }[] {
+function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean, identifierParts: boolean): Matcher[] {
   if (!Array.isArray(payoutIdentifiers)) {
     throw new TypeError("assertNoPayoutImports: payoutIdentifiers must be an array of strings and/or RegExps.");
   }
@@ -938,7 +1041,7 @@ function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { l
       "assertNoPayoutImports: payoutIdentifiers is empty, so nothing would be matched. Pass at least one identifier.",
     );
   }
-  const matchers: { label: string; regex: RegExp }[] = [];
+  const matchers: Matcher[] = [];
   for (let index = 0; index < length; index += 1) {
     if (!hasOwn(payoutIdentifiers, index)) {
       throw new TypeError(`assertNoPayoutImports: payoutIdentifiers[${index}] is missing (a hole in a sparse array).`);
@@ -951,7 +1054,12 @@ function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean): { l
           `assertNoPayoutImports: payoutIdentifiers[${index}] is blank (only whitespace or invisible characters).`,
         );
       }
-      appendOwn(matchers, { label: trimmed, regex: toMatcher(trimmed, caseInsensitive) });
+      appendOwn(
+        matchers,
+        identifierParts
+          ? toPartsMatcher(trimmed, caseInsensitive)
+          : { label: trimmed, regex: toMatcher(trimmed, caseInsensitive) },
+      );
     } else if (typeof identifier === "object" && identifier !== null && kindOf(identifier) === "RegExp") {
       // Read through the RegExp's internal slots, not its own `source`/`flags`.
       // The pattern runs over the whole file (see `findMatches`): `g` makes it
@@ -984,10 +1092,10 @@ function splitLines(content: string): { text: string; start: number }[] {
  * Run every matcher over the whole content (so a pattern may span lines) and
  * report each line where a match starts, once per matcher, in line order.
  */
-function findMatches(content: string, matchers: { label: string; regex: RegExp }[]): PayoutImportOffense["matches"] {
+function findMatches(content: string, matchers: Matcher[]): PayoutImportOffense["matches"] {
   const lines = splitLines(content);
   const found: { line: number; order: number; match: PayoutImportOffense["matches"][number] }[] = [];
-  matchers.forEach(({ label, regex }, order) => {
+  matchers.forEach(({ label, regex, accepts }, order) => {
     regex.lastIndex = 0;
     let lineIndex = 0;
     let reported = -1;
@@ -997,6 +1105,11 @@ function findMatches(content: string, matchers: { label: string; regex: RegExp }
         // code point: stopping inside a surrogate pair makes the next search back up.
         const unicode = regex.flags.includes("u") || regex.flags.includes("v");
         regex.lastIndex += unicode && (content.codePointAt(regex.lastIndex) ?? 0) > 0xffff ? 2 : 1;
+      }
+      if (accepts !== undefined && !accepts(content, hit.index, hit.index + hit[0].length)) {
+        // Not on a part boundary. Resume one code point later, so an overlapping candidate is still seen.
+        regex.lastIndex = hit.index + ((content.codePointAt(hit.index) ?? 0) > 0xffff ? 2 : 1);
+        continue;
       }
       while (lineIndex + 1 < lines.length && (lines[lineIndex + 1]?.start ?? Infinity) <= hit.index) lineIndex += 1;
       if (lineIndex === reported) continue;
@@ -1077,8 +1190,9 @@ function readSourceFiles(files: unknown): [string, string][] {
  * closures that capture a payout value without naming it in the scanned
  * file, computed/dynamic property access (`obj["pay" + "out"]`), a `payout`
  * re-exported under an aliased name, or a `require`/`import()` built from a
- * runtime string. It also will not catch a forbidden word embedded inside a
- * larger identifier with no delimiter (see `toMatcher`). See README.md,
+ * runtime string. By default it also will not catch a forbidden word embedded
+ * inside a larger identifier (see `toMatcher`); `opts.matchIdentifierParts`
+ * finds it when the word is a camelCase, snake_case or kebab-case part. See README.md,
  * "Honest limits", for the full list — an empty result is a signal, not a
  * guarantee.
  *
@@ -1096,8 +1210,8 @@ export function assertNoPayoutImports(
   payoutIdentifiers: (string | RegExp)[],
   opts?: AssertNoPayoutImportsOptions,
 ): PayoutImportOffense[] {
-  const { stripComments, caseInsensitive } = readScanOptions(opts);
-  const matchers = readMatchers(payoutIdentifiers, caseInsensitive);
+  const { stripComments, caseInsensitive, matchIdentifierParts } = readScanOptions(opts);
+  const matchers = readMatchers(payoutIdentifiers, caseInsensitive, matchIdentifierParts);
   const sources = readSourceFiles(files);
 
   const offenses: PayoutImportOffense[] = [];
