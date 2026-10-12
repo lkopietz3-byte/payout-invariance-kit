@@ -534,6 +534,12 @@ cannot see:
   in JSX text opens a template literal that never closes, and JSX text is not
   tokenized, so a `//` inside it (`<p>see https://example.com/payout</p>`)
   starts a comment that hides the rest of that line.
+  Three more rare cases, all needing a regex literal that contains `/*`: one
+  right after a semicolonless `export { a }` or object-type declaration
+  (the brace is read as an object literal, so the `/` divides), one in a
+  `.tsx` file after a comparison `>` (read as the end of a tag), and one
+  after a `++` or `--` that starts a new line (read as postfix). In each,
+  the `/*` inside the regex starts a comment that hides the code after it.
 - **Built-ins and tampering.** The comparison, the copy and the run loop of
   `assertPayoutInvariance` do not look built-ins up while they work. What they
   use (`Object.is`, `Object.keys`, `Object.getPrototypeOf`, `Reflect.get` and
