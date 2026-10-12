@@ -1042,6 +1042,9 @@ function readScanOptions(opts: unknown): Required<AssertNoPayoutImportsOptions> 
   return resolved;
 }
 
+/** Longest string identifier accepted (UTF-16 code units, after trimming). */
+const MAX_IDENTIFIER_LENGTH = 1024;
+
 /** Validate every identifier with one indexed pass and build its matcher. */
 function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean, identifierParts: boolean): Matcher[] {
   if (!Array.isArray(payoutIdentifiers)) {
@@ -1064,6 +1067,14 @@ function readMatchers(payoutIdentifiers: unknown, caseInsensitive: boolean, iden
       if (trimmed === "") {
         throw new TypeError(
           `assertNoPayoutImports: payoutIdentifiers[${index}] is blank (only whitespace or invisible characters).`,
+        );
+      }
+      // Each string becomes one regular expression. Some JavaScript engines in the supported
+      // range (Node 20 and 22) overflow their stack compiling a case-insensitive pattern tens of
+      // thousands of characters long, so a string identifier has a documented maximum length.
+      if (trimmed.length > MAX_IDENTIFIER_LENGTH) {
+        throw new TypeError(
+          `assertNoPayoutImports: payoutIdentifiers[${index}] is ${trimmed.length} characters long; the maximum is ${MAX_IDENTIFIER_LENGTH}.`,
         );
       }
       appendOwn(

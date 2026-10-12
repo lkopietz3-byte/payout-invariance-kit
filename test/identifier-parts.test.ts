@@ -129,12 +129,20 @@ describe("matchIdentifierParts: overlap, case and reporting", () => {
   it("stays linear when a long identifier is rejected at every offset", () => {
     // A run of one letter has no part boundary inside it. The identifier is
     // half the text, so retrying the literal at every character would be quadratic.
-    const n = 30_000;
+    // The identifier is at the 1,024-character maximum; the text is 60 times longer.
+    const n = 1024;
     const started = process.cpuUsage();
-    const offenses = assertNoPayoutImports({ "run.ts": "a".repeat(2 * n) }, ["a".repeat(n)], PARTS);
+    const offenses = assertNoPayoutImports({ "run.ts": "a".repeat(60 * n) }, ["a".repeat(n)], PARTS);
     const spent = process.cpuUsage(started);
     expect(offenses).toEqual([]);
     expect((spent.user + spent.system) / 1000).toBeLessThan(250);
+  });
+
+  it("rejects a string identifier longer than the documented maximum, in both modes", () => {
+    const long = "a".repeat(1025);
+    expect(() => assertNoPayoutImports({ "run.ts": "x" }, [long], PARTS)).toThrow(/maximum is 1024/);
+    expect(() => assertNoPayoutImports({ "run.ts": "x" }, [long])).toThrow(/maximum is 1024/);
+    expect(assertNoPayoutImports({ "run.ts": "x" }, ["a".repeat(1024)], PARTS)).toEqual([]);
   });
 
   it("finds a later valid candidate after a long rejected one", () => {

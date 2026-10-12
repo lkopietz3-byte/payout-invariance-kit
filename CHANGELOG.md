@@ -16,6 +16,11 @@ before upgrading.
 
 Each item says what you will see and what to change.
 
+- A string in `payoutIdentifiers` longer than 1,024 characters (after
+  trimming) throws a `TypeError`. Each string becomes one regular expression,
+  and Node 20 and 22 overflow their stack compiling a case-insensitive pattern
+  tens of thousands of characters long. Migration: shorten the identifier, or
+  pass your own `RegExp`.
 - `assertPayoutInvariance` throws a `TypeError` when `rankFn` returns
   `undefined` on the baseline input. Before, a ranker that always returned
   `undefined` passed. Migration: return the ranking (`[]` for an empty one).

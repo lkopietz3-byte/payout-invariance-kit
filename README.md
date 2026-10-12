@@ -425,7 +425,8 @@ import-path segment by default, e.g. `"commission"` catches `import { commission
 It throws a `TypeError`, before reading any file, instead of returning a
 clean-looking `[]` for a scan that could not mean anything: an empty `files`
 list or map, an empty `payoutIdentifiers` list, a blank identifier (only
-whitespace or invisible characters), an entry that is neither a string nor a
+whitespace or invisible characters), a string identifier longer than 1,024
+characters, an entry that is neither a string nor a
 real `RegExp`, a hole in either list, a `files` value that is neither an
 array of paths nor a plain `{ path: content }` object, non-string content, or
 non-boolean options.
