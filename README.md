@@ -391,8 +391,8 @@ import-path segment by default, e.g. `"commission"` catches `import { commission
   only; `RegExp` entries are used as written. With `caseInsensitive: false`,
   write the identifier in the case the code uses (`"Affiliate"` finds
   `getAffiliate`, `"affiliate"` does not). The scan stays linear in the size
-  of the file: each candidate is checked against its neighbors once, with no
-  backtracking pattern.
+  of the file: a rejected candidate skips ahead to the next part boundary, so
+  no position is checked twice, and no pattern backtracks.
 - **`opts.caseInsensitive`** (default `true`) makes string identifiers match
   regardless of case, in any script. Pass `false` to match case exactly. It
   does not change `RegExp` entries, which are used as written: give one its

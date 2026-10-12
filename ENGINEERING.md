@@ -27,9 +27,10 @@
    import graph. An empty scope (no files or no identifiers) or a blank
    identifier throws a `TypeError` rather than returning a clean `[]`. String
    identifiers are whole words by default; `matchIdentifierParts` also finds
-   them as camelCase, snake_case or kebab-case parts. It checks each
-   candidate against its neighbors once, so the scan stays linear (no
-   backtracking pattern), and the default result does not change.
+   them as camelCase, snake_case or kebab-case parts. A rejected
+   candidate skips ahead to the next part boundary, so the scan stays linear in
+   the file size (no backtracking pattern), and the default result does not
+   change.
 6. Zero runtime dependencies (`dependencies` stays empty).
 
 ## Setup and verification

@@ -525,6 +525,8 @@ interface Matcher {
   regex: RegExp;
   /** When present, a candidate in `[start, end)` counts only if this returns true. */
   accepts?: (content: string, start: number, end: number) => boolean;
+  /** With `accepts`: where to resume the search after a rejected candidate that started at `index`. */
+  resume?: (content: string, index: number) => number;
 }
 
 function escapeRegExp(literal: string): string {
@@ -645,10 +647,20 @@ function isPartBoundary(content: string, index: number, asciiEdge: boolean): boo
 function toPartsMatcher(identifier: string, caseInsensitive: boolean): Matcher {
   const startsAscii = STARTS_WITH_ASCII_WORD_CHAR.test(identifier);
   const endsAscii = ENDS_WITH_ASCII_WORD_CHAR.test(identifier);
+  // A start can only be valid on a part boundary, unless the identifier itself starts with a symbol.
+  const needsStartBoundary = classOf(codePointAt(identifier, 0)) !== "other";
   return {
     label: identifier,
     regex: new RegExp(escapeRegExp(identifier), "gu" + (caseInsensitive ? "i" : "")),
     accepts: (content, start, end) => isPartBoundary(content, start, startsAscii) && isPartBoundary(content, end, endsAscii),
+    // Skip straight to the next part boundary instead of retrying the literal at every character.
+    // Each position is visited once, so the whole scan stays linear in the file size.
+    resume: (content, index) => {
+      let next = index + codePointAt(content, index).length;
+      if (!needsStartBoundary) return next;
+      while (next < content.length && !isPartBoundary(content, next, startsAscii)) next += codePointAt(content, next).length;
+      return next;
+    },
   };
 }
 
@@ -1095,7 +1107,7 @@ function splitLines(content: string): { text: string; start: number }[] {
 function findMatches(content: string, matchers: Matcher[]): PayoutImportOffense["matches"] {
   const lines = splitLines(content);
   const found: { line: number; order: number; match: PayoutImportOffense["matches"][number] }[] = [];
-  matchers.forEach(({ label, regex, accepts }, order) => {
+  matchers.forEach(({ label, regex, accepts, resume }, order) => {
     regex.lastIndex = 0;
     let lineIndex = 0;
     let reported = -1;
@@ -1107,8 +1119,9 @@ function findMatches(content: string, matchers: Matcher[]): PayoutImportOffense[
         regex.lastIndex += unicode && (content.codePointAt(regex.lastIndex) ?? 0) > 0xffff ? 2 : 1;
       }
       if (accepts !== undefined && !accepts(content, hit.index, hit.index + hit[0].length)) {
-        // Not on a part boundary. Resume one code point later, so an overlapping candidate is still seen.
-        regex.lastIndex = hit.index + ((content.codePointAt(hit.index) ?? 0) > 0xffff ? 2 : 1);
+        // Not on a part boundary. Resume at the next place a valid candidate can start, so an
+        // overlapping candidate is still seen.
+        regex.lastIndex = resume !== undefined ? resume(content, hit.index) : hit.index + 1;
         continue;
       }
       while (lineIndex + 1 < lines.length && (lines[lineIndex + 1]?.start ?? Infinity) <= hit.index) lineIndex += 1;

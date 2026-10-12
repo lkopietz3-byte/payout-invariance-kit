@@ -126,6 +126,24 @@ describe("matchIdentifierParts: overlap, case and reporting", () => {
     expect((spent.user + spent.system) / 1000).toBeLessThan(3000);
   });
 
+  it("stays linear when a long identifier is rejected at every offset", () => {
+    // A run of one letter has no part boundary inside it. The identifier is
+    // half the text, so retrying the literal at every character would be quadratic.
+    const n = 30_000;
+    const started = process.cpuUsage();
+    const offenses = assertNoPayoutImports({ "run.ts": "a".repeat(2 * n) }, ["a".repeat(n)], PARTS);
+    const spent = process.cpuUsage(started);
+    expect(offenses).toEqual([]);
+    expect((spent.user + spent.system) / 1000).toBeLessThan(250);
+  });
+
+  it("finds a later valid candidate after a long rejected one", () => {
+    const word = "a".repeat(1000);
+    const source = `${word}${word}\nconst x = get${word.toUpperCase().slice(0, 1)}${word.slice(1)};`;
+    const offenses = assertNoPayoutImports({ "run.ts": source }, [word], PARTS);
+    expect(offenses[0]?.matches.map((m) => m.line)).toEqual([2]);
+  });
+
   it("README example: the word list finds the spellings listed in its comment", () => {
     const source = [
       "const a = card.affiliateUrl;",
@@ -142,5 +160,46 @@ describe("matchIdentifierParts: overlap, case and reporting", () => {
     // The same list without the option misses all but the whole words.
     const plain = assertNoPayoutImports({ "src/lib/rank.ts": source }, words);
     expect(plain[0]?.matches.map((m) => m.line)).toEqual([5, 6]);
+  });
+
+  it("agrees with a position-by-position reference on random ASCII text", () => {
+    const isAlnum = (ch: string): boolean => /^[A-Za-z0-9]$/.test(ch);
+    const kind = (ch: string): "U" | "L" | "D" | "-" => (/[A-Z]/.test(ch) ? "U" : /[a-z]/.test(ch) ? "L" : /[0-9]/.test(ch) ? "D" : "-");
+    const boundary = (text: string, p: number): boolean => {
+      if (p <= 0 || p >= text.length) return true;
+      const prev = text.charAt(p - 1);
+      const next = text.charAt(p);
+      if (!isAlnum(prev) || !isAlnum(next)) return true;
+      const a = kind(prev);
+      const b = kind(next);
+      if (a === "D" || b === "D") return a !== b;
+      if (b === "U" && a === "L") return true;
+      return a === "U" && b === "U" && kind(text.charAt(p + 1)) === "L";
+    };
+    const reference = (text: string, word: string): number[] => {
+      const lines: number[] = [];
+      for (let at = text.indexOf(word); at !== -1; at = text.indexOf(word, at + 1)) {
+        if (boundary(text, at) && boundary(text, at + word.length)) {
+          lines.push(text.slice(0, at).split("\n").length);
+        }
+      }
+      return [...new Set(lines)];
+    };
+    let seed = 12345;
+    const next = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    const alphabet = "aAbB1_-\n ";
+    const letters = "aAbB1";
+    for (let round = 0; round < 400; round += 1) {
+      let text = "";
+      for (let i = next(40); i >= 0; i -= 1) text += alphabet.charAt(next(alphabet.length));
+      let word = "";
+      for (let i = next(4); i >= 0; i -= 1) word += letters.charAt(next(letters.length));
+      const offenses = assertNoPayoutImports({ "f.ts": text }, [word], { matchIdentifierParts: true, caseInsensitive: false, stripComments: false });
+      const found = [...new Set(offenses[0]?.matches.map((m) => m.line) ?? [])];
+      expect({ text, word, found }).toEqual({ text, word, found: reference(text, word) });
+    }
   });
 });
