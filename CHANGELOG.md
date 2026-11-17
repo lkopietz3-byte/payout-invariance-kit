@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-10-12
 
 Some inputs that passed or failed before now give a different (correct) answer
 and a few inputs now throw, so this is a minor release. Read "Breaking changes"
