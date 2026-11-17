@@ -116,26 +116,52 @@ describe("matchIdentifierParts: overlap, case and reporting", () => {
     expect(offenses[0]?.matches.map((m) => m.line)).toEqual([1, 2, 3, 4]);
   });
 
-  it("scans a large file in linear time", () => {
-    // Every candidate is rejected, which is the worst case for the boundary check.
-    const source = "payout".repeat(200_000) + " affiliateUrl";
+  // Timing tests compare growth, not an absolute time. Each size runs several
+  // times and keeps the fastest CPU time, so a loaded machine cannot fail the
+  // test by being slow everywhere. Text eight times larger costs about eight
+  // times as much when the scan is linear and about sixty-four times as much
+  // when it is quadratic; the limit sits between the two. The long timeout only
+  // keeps a loaded machine from ending the test early; it checks nothing.
+  const GROWTH_LIMIT = 24;
+  const RUNS = 5;
+  const cpuMs = (run: () => void): number => {
     const started = process.cpuUsage();
-    const offenses = assertNoPayoutImports({ "big.ts": source }, ["payout", "affiliate"], PARTS);
+    run();
     const spent = process.cpuUsage(started);
-    expect(offenses[0]?.matches.map((m) => m.identifier)).toEqual(["affiliate"]);
-    expect((spent.user + spent.system) / 1000).toBeLessThan(3000);
+    return (spent.user + spent.system) / 1000;
+  };
+  const fastest = (runs: number, run: () => void): number => {
+    let best = Infinity;
+    for (let i = 0; i < runs; i++) best = Math.min(best, cpuMs(run));
+    return best;
+  };
+
+  it("scans a large file in linear time", { timeout: 30_000 }, () => {
+    // Every candidate is rejected, which is the worst case for the boundary check.
+    const scan = (copies: number) => () => {
+      const source = "payout".repeat(copies) + " affiliateUrl";
+      const offenses = assertNoPayoutImports({ "big.ts": source }, ["payout", "affiliate"], PARTS);
+      expect(offenses[0]?.matches.map((m) => m.identifier)).toEqual(["affiliate"]);
+    };
+    scan(5_000)(); // warm up
+    const small = fastest(RUNS, scan(12_500));
+    const large = fastest(RUNS, scan(100_000));
+    expect(large / small, `cpu ms: ${small.toFixed(0)} then ${large.toFixed(0)}`).toBeLessThan(GROWTH_LIMIT);
   });
 
-  it("stays linear when a long identifier is rejected at every offset", () => {
-    // A run of one letter has no part boundary inside it. The identifier is
-    // half the text, so retrying the literal at every character would be quadratic.
-    // The identifier is at the 1,024-character maximum; the text is 60 times longer.
-    const n = 1024;
-    const started = process.cpuUsage();
-    const offenses = assertNoPayoutImports({ "run.ts": "a".repeat(60 * n) }, ["a".repeat(n)], PARTS);
-    const spent = process.cpuUsage(started);
-    expect(offenses).toEqual([]);
-    expect((spent.user + spent.system) / 1000).toBeLessThan(250);
+  it("stays linear when a long identifier is rejected at every offset", { timeout: 30_000 }, () => {
+    // A run of one letter has no part boundary inside it, so every candidate is
+    // rejected. The cost should not grow with the identifier's length: the same
+    // text scanned for an identifier 16 times longer must not take much longer.
+    const text = "a".repeat(60 * 1024);
+    const scan = (identifierLength: number) => () => {
+      const offenses = assertNoPayoutImports({ "run.ts": text }, ["a".repeat(identifierLength)], PARTS);
+      expect(offenses).toEqual([]);
+    };
+    scan(64)(); // warm up
+    const short = fastest(RUNS, scan(64));
+    const long = fastest(RUNS, scan(1024)); // 1,024 is the documented maximum
+    expect(long / short).toBeLessThan(6);
   });
 
   it("rejects a string identifier longer than the documented maximum, in both modes", () => {
