@@ -4,7 +4,6 @@ Check whether a ranking/recommendation/comparison engine's output changes based 
 
 ## Read first
 - `ENGINEERING.md` holds this package's invariants and design rules; read it before changing behavior.
-- `PROJECT_CONTEXT.md` is the current project state and decisions.
 - `SECURITY.md` covers the security posture; follow it for anything touching input handling.
 
 ## Commands (from package.json)
@@ -23,11 +22,7 @@ Check whether a ranking/recommendation/comparison engine's output changes based 
 - Runtime `dependencies` stay empty; add dev tooling only.
 - Keep unrelated uncommitted work intact; never stage or reset the whole tree.
 
-## Review preparation
-
-See [docs/REVIEW_READINESS.md](docs/REVIEW_READINESS.md) for review cadence, declared verification gates and the next consumer integration task.
-
-## Code Review Rules
+## Review notes
 
 - Keep runtime passes non-vacuous: every supplied mutation must change the input and preserve the baseline ranking. Empty/sparse/malformed scopes, async or throwing hooks, non-boolean comparators and in-place baseline changes must fail rather than produce a pass.
 - Preserve caller immutability and fail-closed equality/snapshot behavior, including intrinsic brand checks and enumerable metadata. Coordinate changes to the shared deepEqual/snapshot copies with mutation-invariance-kit; do not add unsafe key writes or weaken hostile-value handling.
