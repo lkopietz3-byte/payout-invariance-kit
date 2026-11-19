@@ -21,7 +21,7 @@ code review.
 
 A passing result from either check means "no dependence found in the
 scenarios and files you checked", not "the ranking is neutral in general".
-See [Honest limits](#honest-limits) before you rely on a green check for
+See [Honest limits](#honest-limits-read-this-before-trusting-a-green-check) before you rely on a green check for
 anything.
 
 Both return plain data and never call a test framework's `expect()`. You
@@ -303,7 +303,7 @@ primitives, `arguments` objects, buffers, `DataView`s and typed arrays
 `ArrayBuffer`). Built-ins are recognized by brand checks and read through
 the built-in operations. Array holes differ from `undefined`, circular
 references are handled, and values it cannot inspect are equal only to
-themselves (see [Honest limits](#honest-limits)). It never mutates its
+themselves (see [Honest limits](#honest-limits-read-this-before-trusting-a-green-check)). It never mutates its
 arguments; an error thrown by a getter or `Proxy` trap it reads propagates.
 
 ```ts
